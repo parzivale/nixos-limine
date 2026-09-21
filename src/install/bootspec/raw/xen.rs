@@ -14,8 +14,11 @@ pub(super) struct RawXen {
     version: Option<String>,
 }
 
-/// `None` when the extension names no version, which is how the script
-/// decides a generation has no Xen entries at all.
+/// `None` when the extension names no version.
+///
+/// The version is what the menu entries are labelled with, so a generation
+/// whose extension predates it -- or carries only part of it -- gets no Xen
+/// entries rather than ones that cannot be told apart.
 ///
 /// Whether the multiboot binary is still on disk is not asked here: that is a
 /// fact about the world, and is gathered with the others.

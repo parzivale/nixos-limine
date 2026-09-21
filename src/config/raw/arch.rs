@@ -15,10 +15,11 @@ pub(super) struct RawArch {
 
 /// Which limine binaries this CPU needs, or a hard error.
 ///
-/// The script only decides this once it is about to copy the EFI binary
-/// (`limine-install.py:486-500`), by which point it has already written to the
-/// ESP; and an `x86` CPU that is neither 32- nor 64-bit falls through its
-/// `if`/`elif` with an empty filename rather than reaching the raise.
+/// The wire format describes a CPU as a family, a width and an optional
+/// architecture name, which between them can describe far more than limine
+/// ships binaries for. Narrowing here means an unsupported CPU is refused
+/// before the install has written anything, rather than when it reaches for
+/// a file that was never built.
 pub(super) fn resolve(r: &RawArch) -> Result<Arch, ConfigError> {
     Ok(match (r.family.as_str(), r.bits, r.arch.as_deref()) {
         ("x86", 32, _) => Arch::I686,

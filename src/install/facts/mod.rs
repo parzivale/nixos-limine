@@ -2,7 +2,7 @@
 //! deciding what to do is a function from data to data.
 //!
 //! Gathering these is the only part of working out an install that touches the
-//! filesystem or runs anything; see [`super::load`].
+//! filesystem or runs anything; see [`gather`].
 
 mod disk;
 mod load;

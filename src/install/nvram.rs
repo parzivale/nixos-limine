@@ -1,19 +1,15 @@
-//! Registering limine with the firmware.
+//! The boot entry that makes a firmware find limine.
 //!
-//! Building the entry is a function of the partition we were told about;
-//! [`register`] is the only part that touches the firmware's variables.
+//! This only builds it. Writing it to the firmware's variables is
+//! [`crate::install::effect::register`].
 //!
-//! A move off `efivar` is warranted. Its device path handling is hand-rolled
-//! -- `format` is a bare u8, and `EFIHardDriveType::Unknown::as_u8` panics --
-//! and the crate has been quiet since early 2024. `uefi` (uefi-rs) generates
-//! its device path nodes from the spec, types the partition format and
-//! signature, and does build and run outside a UEFI target, so it is the
-//! better source for the bytes that decide whether the firmware finds us.
-//!
-//! What it does not carry is `EFI_LOAD_OPTION` or efivarfs access, so the swap
-//! costs us the `Boot####` payload assembly and a small efivarfs writer
-//! (rustix, which we already depend on, has the ioctls for the immutable flag
-//! efivar clears today).
+//! These bytes decide whether the machine boots, and a wrong one fails at the
+//! next power-on rather than here, so the device path is worth being careful
+//! with. `efivar` is a weak source for it: `format` is an untyped u8 and
+//! `EFIHardDriveType::Unknown::as_u8` panics outright. `uefi` (uefi-rs)
+//! generates its device path nodes from the UEFI spec and does build off a
+//! UEFI target, so it would be the better source -- but it carries no
+//! `EFI_LOAD_OPTION` and no efivarfs, which is the rest of what this needs.
 
 use super::facts::Partition;
 use efivar::boot::{

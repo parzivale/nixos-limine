@@ -77,8 +77,8 @@ fn linux_entry(
         ));
     }
 
-    // the script ran while the facts were gathered; an older generation that
-    // could no longer produce its secrets simply has none
+    // the secrets script ran while the facts were gathered; a generation that
+    // can no longer produce its secrets simply has none
     if let Some(secrets) = facts.secrets(spec.toplevel()) {
         let name = format!("{}-secrets", file_name(spec.toplevel()));
         let dest = plan.install_dir().join(KERNELS).join(&name);
@@ -340,8 +340,8 @@ module_path: boot():/limine/kernels/ccc-initrd-initrd
         assert!(entries.contains("module_path: boot():/limine/kernels/ccc-initrd-initrd#bbb"));
     }
 
-    /// The script ran while the facts were gathered; the entry just carries
-    /// what it produced.
+    /// The secrets script ran while the facts were gathered; the entry just
+    /// carries what it produced.
     #[test]
     fn adds_a_secrets_module_when_the_script_produced_one() {
         let facts = fixture::with_secrets(one(&boot_json("", "")), TOPLEVEL, b"secret");

@@ -185,8 +185,9 @@ pub(crate) enum EfiDiscovery {
     Removable,
     /// Installed under `/EFI/limine/` and registered in NVRAM.
     Registered,
-    /// Installed under `/EFI/limine/` with **no** NVRAM entry; the user must
-    /// add one themselves. The Python script only warns about this.
+    /// Installed under `/EFI/limine/` with **no** NVRAM entry, which nothing
+    /// will find unless the user adds one by hand. Allowed, because the
+    /// firmware may already have an entry pointing there, but warned about.
     Unregistered,
 }
 

@@ -20,9 +20,13 @@ struct RawAutoEnrollKeys {
     extra_args: Vec<String>,
 }
 
-/// Collapses four flags into the three states the script actually branches on
-/// (`limine-install.py:516-550`): off; on with keys that must already exist;
-/// on with key generation, which is the only path that can enrol.
+/// Collapses four flags into the three states an install can be in: off; on
+/// with keys that have to already exist; on with key generation, which is
+/// the only path that can go on to enrol them.
+///
+/// The flags allow combinations that mean nothing -- enrolment without
+/// generation, most obviously -- and nesting them makes those unreachable
+/// rather than something every later branch has to keep checking for.
 pub(super) fn resolve(r: &RawSecureBoot, fwupd: Option<&Path>) -> SecureBoot {
     if !r.enable {
         return SecureBoot::Disabled;
