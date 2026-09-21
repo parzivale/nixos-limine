@@ -11,25 +11,25 @@ use std::{
 #[derive(Debug, Deserialize)]
 #[serde(from = "Raw")]
 pub(crate) struct BootSpec {
-    pub init: PathBuf,
-    pub kernel: PathBuf,
-    pub kernel_params: Vec<String>,
-    pub label: String,
-    pub toplevel: PathBuf,
-    pub initrd: Option<PathBuf>,
-    pub initrd_secrets: Option<PathBuf>,
-    pub specialisations: BTreeMap<String, Self>,
-    pub xen: Option<Xen>,
+    pub(super) init: PathBuf,
+    pub(super) kernel: PathBuf,
+    pub(super) kernel_params: Vec<String>,
+    pub(super) label: String,
+    pub(super) toplevel: PathBuf,
+    pub(super) initrd: Option<PathBuf>,
+    pub(super) initrd_secrets: Option<PathBuf>,
+    pub(super) specialisations: BTreeMap<String, Self>,
+    pub(super) xen: Option<Xen>,
 }
 
 /// The Xen dom0 extension, once it names a version to label its entries with.
 #[derive(Debug)]
 pub(crate) struct Xen {
-    pub version: String,
-    pub params: Vec<String>,
+    pub(super) version: String,
+    pub(super) params: Vec<String>,
     /// `None` when the multiboot binary is missing. The entry is still listed,
     /// but with no protocol to boot it by.
-    pub boot: Option<XenBoot>,
+    pub(super) boot: Option<XenBoot>,
 }
 
 impl Xen {
@@ -39,15 +39,63 @@ impl Xen {
     }
 }
 
+impl Xen {
+    pub(crate) fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub(crate) const fn boot(&self) -> Option<&XenBoot> {
+        self.boot.as_ref()
+    }
+}
+
+impl XenBoot {
+    pub(crate) fn multiboot(&self) -> &Path {
+        &self.multiboot
+    }
+
+    pub(crate) fn efi(&self) -> Option<&Path> {
+        self.efi.as_deref()
+    }
+}
+
 /// What the Xen entries load, under either protocol.
 #[derive(Debug)]
 pub(crate) struct XenBoot {
-    pub multiboot: PathBuf,
+    pub(super) multiboot: PathBuf,
     /// Xen's own EFI binary, which the EFI entry chainloads instead.
-    pub efi: Option<PathBuf>,
+    pub(super) efi: Option<PathBuf>,
 }
 
 impl BootSpec {
+    pub(crate) fn kernel(&self) -> &Path {
+        &self.kernel
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn toplevel(&self) -> &Path {
+        &self.toplevel
+    }
+
+    pub(crate) fn initrd(&self) -> Option<&Path> {
+        self.initrd.as_deref()
+    }
+
+    pub(crate) fn initrd_secrets(&self) -> Option<&Path> {
+        self.initrd_secrets.as_deref()
+    }
+
+    pub(crate) const fn specialisations(&self) -> &BTreeMap<String, Self> {
+        &self.specialisations
+    }
+
+    pub(crate) const fn xen(&self) -> Option<&Xen> {
+        self.xen.as_ref()
+    }
+
     pub(crate) fn load(path: &Path) -> Result<Self, InstallError> {
         let json = fs::read_to_string(path).context(ReadSnafu { path })?;
 

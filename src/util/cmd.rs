@@ -1,16 +1,85 @@
 use snafu::{ResultExt as _, Snafu, ensure};
 use std::{
-    path::PathBuf,
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
     process::{Command, ExitStatus},
 };
+
+/// A program and its arguments, decided without running anything.
+///
+/// Working out what to run is a function of the config and the facts; running
+/// it is the shell's job, which is what makes the deciding testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Invocation {
+    program: PathBuf,
+    args: Vec<OsString>,
+}
+
+impl Invocation {
+    pub(crate) fn new(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        self.args.push(arg.as_ref().to_os_string());
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn args<I, A>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<OsStr>,
+    {
+        self.args
+            .extend(args.into_iter().map(|arg| arg.as_ref().to_os_string()));
+        self
+    }
+
+    pub(crate) fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// `program arg arg`, for tests that assert on what would be run.
+    #[cfg(test)]
+    pub(crate) fn line(&self) -> String {
+        let mut line = self.program.display().to_string();
+
+        for arg in &self.args {
+            line.push(' ');
+            line.push_str(&arg.to_string_lossy());
+        }
+
+        line
+    }
+
+    pub(crate) fn run(&self) -> Result<Output, CmdError> {
+        run(Command::new(&self.program).args(&self.args))
+    }
+}
 
 /// A finished run of a helper binary.
 #[derive(Debug)]
 pub(crate) struct Output {
     program: PathBuf,
-    pub status: ExitStatus,
+    status: ExitStatus,
     /// stdout followed by stderr.
-    pub text: String,
+    text: String,
+}
+
+impl Output {
+    pub(crate) const fn status(&self) -> ExitStatus {
+        self.status
+    }
+
+    /// What the program printed, stdout followed by stderr.
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -82,53 +151,48 @@ impl std::fmt::Display for Text<'_> {
 #[cfg(test)]
 mod tests {
     use super::run;
-    use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf, process::Command};
-    use tempfile::TempDir;
+    use std::process::Command;
 
     /// A program that behaves however the test needs it to.
-    fn program(script: &str) -> (TempDir, PathBuf) {
-        let dir = TempDir::new().expect("temp dir");
-        let path = dir.path().join("program");
+    ///
+    /// This runs `sh -c` rather than writing a script and executing it: with
+    /// tests running in parallel, a thread that forks while another still
+    /// holds a write handle to the script inherits it, and the exec then
+    /// fails with ETXTBSY.
+    fn program(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
 
-        fs::write(&path, format!("#!/bin/sh\n{script}")).expect("write");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
-
-        (dir, path)
+        command
     }
 
     #[test]
     fn captures_stdout_and_stderr_together() {
-        let (_dir, path) = program("echo out\necho err >&2\n");
+        let output = run(&mut program("echo out; echo err >&2")).expect("ran");
 
-        let output = run(&mut Command::new(path)).expect("ran");
-
-        assert!(output.status.success());
-        assert!(output.text.contains("out"), "{:?}", output.text);
-        assert!(output.text.contains("err"), "{:?}", output.text);
+        assert!(output.status().success());
+        assert!(output.text().contains("out"), "{:?}", output.text());
+        assert!(output.text().contains("err"), "{:?}", output.text());
     }
 
     /// A non-zero exit is data, not an error -- the caller decides.
     #[test]
     fn a_non_zero_exit_is_not_an_error_by_itself() {
-        let (_dir, path) = program("exit 3\n");
+        let output = run(&mut program("exit 3")).expect("ran");
 
-        let output = run(&mut Command::new(path)).expect("ran");
-
-        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.status().code(), Some(3));
     }
 
     /// Until the caller says it is.
     #[test]
     fn success_turns_a_non_zero_exit_into_an_error() {
-        let (_dir, path) = program("exit 3\n");
-
-        let error = run(&mut Command::new(&path))
+        let error = run(&mut program("exit 3"))
             .expect("ran")
             .success()
             .unwrap_err();
 
         let message = error.to_string();
-        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("sh"), "{message}");
         assert!(message.contains("exit status: 3"), "{message}");
     }
 
@@ -136,9 +200,7 @@ mod tests {
     /// travel with it rather than being discarded.
     #[test]
     fn a_failure_carries_what_the_program_printed() {
-        let (_dir, path) = program("echo 'setup mode is disabled' >&2\nexit 1\n");
-
-        let error = run(&mut Command::new(path))
+        let error = run(&mut program("echo 'setup mode is disabled' >&2; exit 1"))
             .expect("ran")
             .success()
             .unwrap_err();
@@ -151,9 +213,7 @@ mod tests {
 
     #[test]
     fn success_is_quiet_when_the_program_succeeds() {
-        let (_dir, path) = program("echo fine\n");
-
-        run(&mut Command::new(path))
+        run(&mut program("echo fine"))
             .expect("ran")
             .success()
             .expect("ok");
@@ -170,11 +230,15 @@ mod tests {
 
     #[test]
     fn arguments_reach_the_program() {
-        let (_dir, path) = program("echo \"$@\"\n");
+        let output = run(Command::new("sh").args([
+            "-c",
+            r#"echo "$@""#,
+            "--",
+            "--microsoft",
+            "--firmware-builtin",
+        ]))
+        .expect("ran");
 
-        let output =
-            run(Command::new(path).args(["--microsoft", "--firmware-builtin"])).expect("ran");
-
-        assert_eq!(output.text.trim(), "--microsoft --firmware-builtin");
+        assert_eq!(output.text().trim(), "--microsoft --firmware-builtin");
     }
 }

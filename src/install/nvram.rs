@@ -1,8 +1,7 @@
 //! Registering limine with the firmware.
 //!
-//! `efivar` owns the efivarfs side, including clearing the immutable flag an
-//! existing variable carries, and `gpt` owns the partition table; between them
-//! we only have to name the entry and keep the boot order.
+//! Building the entry is a function of the partition we were told about;
+//! [`register`] is the only part that touches the firmware's variables.
 //!
 //! A move off `efivar` is warranted. Its device path handling is hand-rolled
 //! -- `format` is a bare u8, and `EFIHardDriveType::Unknown::as_u8` panics --
@@ -14,13 +13,9 @@
 //! What it does not carry is `EFI_LOAD_OPTION` or efivarfs access, so the swap
 //! costs us the `Boot####` payload assembly and a small efivarfs writer
 //! (rustix, which we already depend on, has the ioctls for the immutable flag
-//! efivar clears today). Worth doing behind a test that boots off the entry.
+//! efivar clears today).
 
-use super::error::{
-    InstallError, NoSuchPartitionSnafu, NvramSnafu, PartitionTableSnafu, ReadSnafu,
-    UnknownPartitionSnafu,
-};
-use crate::util::mountinfo;
+use super::{error::InstallError, error::NvramSnafu, facts::Partition};
 use efivar::{
     VarManager,
     boot::{
@@ -28,11 +23,7 @@ use efivar::{
     },
     efi::Variable,
 };
-use snafu::{OptionExt as _, ResultExt as _};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use snafu::ResultExt as _;
 
 /// What the entry is called in the firmware's boot menu.
 const LABEL: &str = "Limine";
@@ -40,24 +31,31 @@ const LABEL: &str = "Limine";
 /// The GPT-flavoured `MBRType` of a hard drive device path node.
 const GPT_FORMAT: u8 = 0x02;
 
-/// Point the firmware at the copy of limine we just installed, reusing our own
-/// entry so that its position in the boot order survives.
-pub(crate) fn register(mount_point: &Path, boot_file: &str) -> Result<(), InstallError> {
-    let partition = mountinfo::device_for(mount_point)?;
-    let hard_drive = hard_drive(&partition)?;
-
-    let entry = BootEntry {
+/// The boot entry naming limine on the partition it was installed to.
+pub(crate) fn entry(esp: &Partition, boot_file: &str) -> BootEntry {
+    BootEntry {
         attributes: BootEntryAttributes::LOAD_OPTION_ACTIVE,
         description: LABEL.to_owned(),
         file_path_list: Some(FilePathList {
             file_path: FilePath {
                 path: format!("\\efi\\limine\\{boot_file}"),
             },
-            hard_drive,
+            hard_drive: EFIHardDrive {
+                partition_number: esp.number(),
+                partition_start: esp.start(),
+                partition_size: esp.size(),
+                partition_sig: esp.guid(),
+                format: GPT_FORMAT,
+                sig_type: EFIHardDriveType::Gpt,
+            },
         }),
         optional_data: Vec::new(),
-    };
+    }
+}
 
+/// Write it, reusing our own slot so that its position in the boot order
+/// survives.
+pub(crate) fn register(entry: BootEntry) -> Result<(), InstallError> {
     let mut manager = efivar::system();
 
     let used = used_ids(&*manager)?;
@@ -101,73 +99,57 @@ fn free_id(used: &[u16]) -> u16 {
         .unwrap_or_default()
 }
 
-/// The hard drive device path node naming the partition the ESP lives on, read
-/// straight out of the disk's partition table.
-fn hard_drive(partition: &Path) -> Result<EFIHardDrive, InstallError> {
-    let number = partition_number(partition)?;
-    let disk = disk_of(partition)?;
-
-    let table = gpt::GptConfig::new()
-        .writable(false)
-        .open(&disk)
-        .context(PartitionTableSnafu { path: &disk })?;
-
-    let entry = table
-        .partitions()
-        .get(&number)
-        .context(NoSuchPartitionSnafu { path: disk, number })?;
-
-    Ok(EFIHardDrive {
-        partition_number: number,
-        partition_start: entry.first_lba,
-        partition_size: entry.last_lba + 1 - entry.first_lba,
-        partition_sig: entry.part_guid,
-        format: GPT_FORMAT,
-        sig_type: EFIHardDriveType::Gpt,
-    })
-}
-
-/// 1-based, and the same number the partition table uses.
-fn partition_number(partition: &Path) -> Result<u32, InstallError> {
-    let path = sysfs_dir(partition)?.join("partition");
-    let number = fs::read_to_string(&path).context(ReadSnafu { path: &path })?;
-
-    number
-        .trim()
-        .parse()
-        .ok()
-        .context(UnknownPartitionSnafu { path: partition })
-}
-
-/// The whole disk a partition belongs to, via its parent in sysfs.
-fn disk_of(partition: &Path) -> Result<PathBuf, InstallError> {
-    let sysfs = sysfs_dir(partition)?;
-
-    let disk = sysfs
-        .parent()
-        .and_then(Path::file_name)
-        .context(UnknownPartitionSnafu { path: partition })?;
-
-    Ok(Path::new("/dev").join(disk))
-}
-
-fn sysfs_dir(partition: &Path) -> Result<PathBuf, InstallError> {
-    let partition = fs::canonicalize(partition).context(ReadSnafu { path: partition })?;
-    let name = partition.strip_prefix("/dev").unwrap_or(&partition);
-
-    let sysfs = Path::new("/sys/class/block").join(name);
-
-    fs::canonicalize(&sysfs).context(ReadSnafu { path: sysfs })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::free_id;
+    use super::{GPT_FORMAT, entry, free_id};
+    use crate::install::facts::fixture::esp;
+    use efivar::boot::{BootEntryAttributes, EFIHardDriveType};
 
     #[test]
     fn takes_the_lowest_free_slot() {
         assert_eq!(free_id(&[]), 0);
         assert_eq!(free_id(&[0, 1, 3]), 2);
         assert_eq!(free_id(&[2, 0, 1]), 3);
+    }
+
+    /// The bytes here are what decides whether the firmware finds limine at
+    /// all, and a wrong one fails at the next reboot rather than now.
+    #[test]
+    fn names_the_partition_the_esp_is_on() {
+        let entry = entry(&esp(), "BOOTAA64.EFI");
+
+        let list = entry.file_path_list.expect("a device path");
+        let drive = list.hard_drive;
+
+        assert_eq!(drive.partition_number, 1);
+        assert_eq!(drive.partition_start, 2048);
+        assert_eq!(drive.partition_size, 1_048_576);
+        assert_eq!(drive.partition_sig, esp().guid());
+        assert_eq!(drive.format, GPT_FORMAT);
+        assert_eq!(drive.sig_type, EFIHardDriveType::Gpt);
+    }
+
+    /// Backslashes, and the directory a registered install uses rather than
+    /// the removable one.
+    #[test]
+    fn points_at_the_loader_the_way_efi_spells_paths() {
+        let entry = entry(&esp(), "BOOTX64.EFI");
+
+        assert_eq!(
+            entry.file_path_list.expect("a device path").file_path.path,
+            r"\efi\limine\BOOTX64.EFI"
+        );
+    }
+
+    #[test]
+    fn is_an_active_entry_the_firmware_will_try() {
+        let entry = entry(&esp(), "BOOTAA64.EFI");
+
+        assert_eq!(entry.description, "Limine");
+        assert!(
+            entry
+                .attributes
+                .contains(BootEntryAttributes::LOAD_OPTION_ACTIVE)
+        );
     }
 }

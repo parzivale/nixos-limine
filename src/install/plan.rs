@@ -1,5 +1,4 @@
 use super::error::{CopySnafu, CreateDirSnafu, InstallError, ReadSnafu, RemoveSnafu, WriteSnafu};
-use crate::util::hash;
 use snafu::ResultExt as _;
 use std::{
     collections::BTreeSet,
@@ -17,7 +16,6 @@ use std::{
 /// destination.
 pub(crate) struct Plan {
     install_dir: PathBuf,
-    validate_checksums: bool,
     actions: Vec<Action>,
 }
 
@@ -42,10 +40,9 @@ impl Action {
 }
 
 impl Plan {
-    pub(crate) fn new(install_dir: &Path, validate_checksums: bool) -> Self {
+    pub(crate) fn new(install_dir: &Path) -> Self {
         Self {
             install_dir: install_dir.to_path_buf(),
-            validate_checksums,
             actions: Vec::new(),
         }
     }
@@ -85,24 +82,25 @@ impl Plan {
     /// Where `path` lands under `target`, named after the store path it came
     /// from so that two generations never collide.
     pub(crate) fn dest_path(&self, path: &Path, target: &str) -> PathBuf {
-        self.install_dir.join(target).join(dest_file(path))
+        self.install_dir().join(target).join(dest_file(path))
     }
 
     /// Ask for `path` under `target`, and return the URI limine.conf refers to
-    /// it by.
-    pub(crate) fn copied_uri(&mut self, path: &Path, target: &str) -> Result<String, InstallError> {
+    /// it by. The digest is one limine verifies before booting the file, and
+    /// is absent when checksums are off.
+    pub(crate) fn copied_uri(&mut self, path: &Path, target: &str, digest: Option<&str>) -> String {
         let to = self.dest_path(path, target);
 
         self.copy_if_missing(path, &to);
 
         let mut uri = format!("boot():{}", uri_path(path, target).display());
 
-        if self.validate_checksums {
+        if let Some(digest) = digest {
             uri.push('#');
-            uri.push_str(&hash::blake2b_file(path).context(ReadSnafu { path })?);
+            uri.push_str(digest);
         }
 
-        Ok(uri)
+        uri
     }
 
     /// Everything the plan asks for, then everything under the install
@@ -246,7 +244,7 @@ mod tests {
     const KERNEL: &str = "/nix/store/abcdef-linux-6.18.50/Image";
 
     fn plan() -> Plan {
-        Plan::new(Path::new("/boot/limine"), false)
+        Plan::new(Path::new("/boot/limine"))
     }
 
     /// The store hash has to survive into the name, or two generations sharing
@@ -314,10 +312,22 @@ mod tests {
     #[test]
     fn asks_for_kernels_only_if_they_are_missing() {
         let mut plan = plan();
-        let uri = plan.copied_uri(Path::new(KERNEL), "kernels").unwrap();
+        let uri = plan.copied_uri(Path::new(KERNEL), "kernels", None);
 
         assert_eq!(uri, "boot():/limine/kernels/abcdef-linux-6.18.50-Image");
         assert!(matches!(plan.actions(), [Action::CopyIfMissing { .. }]));
+    }
+
+    /// limine verifies the digest before booting the file.
+    #[test]
+    fn appends_a_digest_when_it_is_given_one() {
+        let mut plan = plan();
+        let uri = plan.copied_uri(Path::new(KERNEL), "kernels", Some("abc123"));
+
+        assert_eq!(
+            uri,
+            "boot():/limine/kernels/abcdef-linux-6.18.50-Image#abc123"
+        );
     }
 
     mod apply {
@@ -344,7 +354,7 @@ mod tests {
             }
 
             fn plan(&self) -> Plan {
-                Plan::new(&self.install_dir(), false)
+                Plan::new(&self.install_dir())
             }
 
             fn source(&self, name: &str, contents: &str) -> PathBuf {

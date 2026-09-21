@@ -1,19 +1,11 @@
 use super::{
     bootspec::{BootSpec, Xen},
-    error::{InstallError, ReadSnafu, RemoveSnafu, XenWithoutEfiPathSnafu},
+    error::{InstallError, XenWithoutEfiPathSnafu},
+    facts::{Facts, Generation},
     plan::Plan,
-    profiles::Profiles,
 };
-use crate::util::cmd;
-use jiff::{Timestamp, tz::TimeZone};
-use rustix::{fs::Mode, process};
-use snafu::{OptionExt as _, ResultExt as _};
-use std::{
-    fs,
-    os::unix::fs::MetadataExt as _,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use snafu::OptionExt as _;
+use std::path::Path;
 
 /// Where the kernels, initrds and their secrets are copied to.
 const KERNELS: &str = "kernels";
@@ -22,23 +14,22 @@ const KERNELS: &str = "kernels";
 /// generation itself, then its specialisations.
 pub(crate) fn generate(
     plan: &mut Plan,
-    profiles: &Profiles,
-    profile: &str,
-    generation: u32,
+    facts: &Facts,
+    generation: &Generation,
     efi_support: bool,
     expanded: bool,
 ) -> Result<String, InstallError> {
-    let link = profiles.generation_path(profile, generation);
-    let time = built_at(&link)?;
-    let spec = BootSpec::load(&link.join("boot.json"))?;
+    let spec = generation.spec();
+    let number = generation.number();
+    let time = generation.built_at();
 
     let mut blocks = Vec::new();
 
-    if let Some(xen) = &spec.xen {
+    if let Some(xen) = spec.xen() {
         if efi_support {
-            blocks.push(xen_entry(plan, 2, &spec, xen, generation, &time, true)?);
+            blocks.push(xen_entry(plan, facts, 2, spec, xen, number, time, true)?);
         }
-        blocks.push(xen_entry(plan, 2, &spec, xen, generation, &time, false)?);
+        blocks.push(xen_entry(plan, facts, 2, spec, xen, number, time, false)?);
     }
 
     // A generation with specialisations becomes a submenu holding them.
@@ -47,17 +38,17 @@ pub(crate) fn generate(
     if spec.has_specialisations() {
         let marker = if expanded { "+" } else { "" };
         blocks.push(format!(
-            "{}{marker}Generation {generation}\n",
+            "{}{marker}Generation {number}\n",
             "/".repeat(depth - 1)
         ));
-        blocks.push(linux_entry(plan, depth, &spec, "Default", &time)?);
+        blocks.push(linux_entry(plan, facts, depth, spec, "Default", time));
     } else {
-        let label = format!("Generation {generation}");
-        blocks.push(linux_entry(plan, depth, &spec, &label, &time)?);
+        let label = format!("Generation {number}");
+        blocks.push(linux_entry(plan, facts, depth, spec, &label, time));
     }
 
-    for (name, spec) in &spec.specialisations {
-        blocks.push(linux_entry(plan, depth, spec, name, &time)?);
+    for (name, spec) in spec.specialisations() {
+        blocks.push(linux_entry(plan, facts, depth, spec, name, time));
     }
 
     Ok(blocks.concat())
@@ -65,41 +56,51 @@ pub(crate) fn generate(
 
 fn linux_entry(
     plan: &mut Plan,
+    facts: &Facts,
     levels: usize,
     spec: &BootSpec,
     label: &str,
     time: &str,
-) -> Result<String, InstallError> {
+) -> String {
     let mut lines = vec![
         format!("{}{label}", "/".repeat(levels)),
         "protocol: linux".to_owned(),
-        format!("comment: {}, built on {time}", spec.label),
-        format!("kernel_path: {}", plan.copied_uri(&spec.kernel, KERNELS)?),
+        format!("comment: {}, built on {time}", spec.label()),
+        format!("kernel_path: {}", copy(plan, facts, spec.kernel(), KERNELS)),
         format!("cmdline: {}", spec.cmdline()),
     ];
 
-    if let Some(initrd) = &spec.initrd {
+    if let Some(initrd) = spec.initrd() {
         lines.push(format!(
             "module_path: {}",
-            plan.copied_uri(initrd, KERNELS)?
+            copy(plan, facts, initrd, KERNELS)
         ));
     }
 
-    if let Some(secrets) = &spec.initrd_secrets
-        && let Some(path) = build_secrets(plan, spec, secrets, label)?
-    {
-        lines.push(format!("module_path: {}", plan.copied_uri(&path, KERNELS)?));
+    // the script ran while the facts were gathered; an older generation that
+    // could no longer produce its secrets simply has none
+    if let Some(secrets) = facts.secrets(spec.toplevel()) {
+        let name = format!("{}-secrets", file_name(spec.toplevel()));
+        let dest = plan.install_dir().join(KERNELS).join(&name);
+
+        plan.write(&dest, secrets.to_vec());
+        lines.push(format!(
+            "module_path: {}",
+            plan.copied_uri(&dest, KERNELS, facts.digest(&dest))
+        ));
     }
 
-    Ok(block(&lines))
+    block(&lines)
 }
 
 /// Xen is loaded as the executable, with the kernel and initrd as modules.
 /// Under EFI that goes through Xen's own EFI binary and its `.cfg`, because
 /// limine cannot find an entry point in Xen's multiboot binary (limine #482),
 /// and multiboot1 does not work under EFI at all (limine #483).
+#[expect(clippy::too_many_arguments, reason = "one entry needs all of it")]
 fn xen_entry(
     plan: &mut Plan,
+    facts: &Facts,
     levels: usize,
     spec: &BootSpec,
     xen: &Xen,
@@ -107,7 +108,7 @@ fn xen_entry(
     time: &str,
     efi: bool,
 ) -> Result<String, InstallError> {
-    let version = &xen.version;
+    let version = xen.version();
     let suffix = if efi { " EFI" } else { "" };
 
     let mut lines = vec![
@@ -115,25 +116,23 @@ fn xen_entry(
             "{}Generation {generation} with Xen {version}{suffix}",
             "/".repeat(levels)
         ),
-        format!("comment: Xen {version} {}, built on {time}", spec.label),
+        format!("comment: Xen {version} {}, built on {time}", spec.label()),
     ];
 
-    let Some(boot) = &xen.boot else {
+    // a generation can name a multiboot binary that has since been collected
+    let Some(boot) = xen.boot().filter(|boot| facts.present(boot.multiboot())) else {
         return Ok(block(&lines));
     };
 
     let target = format!("xen/{generation}");
 
     if efi {
-        let binary = boot
-            .efi
-            .as_deref()
-            .context(XenWithoutEfiPathSnafu { generation })?;
+        let binary = boot.efi().context(XenWithoutEfiPathSnafu { generation })?;
 
         lines.push("protocol: efi".to_owned());
         lines.push(format!(
             "path: {}",
-            xen_efi_files(plan, spec, xen, binary, generation)?
+            xen_efi_files(plan, facts, spec, xen, binary, generation)
         ));
 
         return Ok(block(&lines));
@@ -142,24 +141,25 @@ fn xen_entry(
     lines.push("protocol: multiboot".to_owned());
     lines.push(format!(
         "path: {}",
-        plan.copied_uri(&boot.multiboot, &target)?
+        copy(plan, facts, boot.multiboot(), &target)
     ));
 
     // The leading `--` works around the first argument being dropped.
-    if !xen.params.is_empty() {
-        lines.push(format!("cmdline: -- {}", xen.params()));
+    let params = xen.params();
+    if !params.is_empty() {
+        lines.push(format!("cmdline: -- {params}"));
     }
 
     lines.push(format!(
         "module_path: {}",
-        plan.copied_uri(&spec.kernel, KERNELS)?
+        copy(plan, facts, spec.kernel(), KERNELS)
     ));
     lines.push(format!("module_string: -- {}", spec.cmdline()));
 
-    if let Some(initrd) = &spec.initrd {
+    if let Some(initrd) = spec.initrd() {
         lines.push(format!(
             "module_path: {}",
-            plan.copied_uri(initrd, KERNELS)?
+            copy(plan, facts, initrd, KERNELS)
         ));
     }
 
@@ -170,14 +170,15 @@ fn xen_entry(
 /// return the URI of the binary itself.
 fn xen_efi_files(
     plan: &mut Plan,
+    facts: &Facts,
     spec: &BootSpec,
     xen: &Xen,
     efi_path: &Path,
     generation: u32,
-) -> Result<String, InstallError> {
+) -> String {
     let target = format!("xen/{generation}");
 
-    let uri = plan.copied_uri(efi_path, &target)?;
+    let uri = copy(plan, facts, efi_path, &target);
     let config_path = plan.dest_path(efi_path, &target).with_extension("cfg");
 
     let mut lines = vec![
@@ -186,15 +187,16 @@ fn xen_efi_files(
         format!("[nixos{generation}]"),
     ];
 
-    if !xen.params.is_empty() {
-        lines.push(format!("options={}", xen.params()));
+    let params = xen.params();
+    if !params.is_empty() {
+        lines.push(format!("options={params}"));
     }
 
-    let kernel = plan.dest_path(&spec.kernel, &target);
-    plan.copy(&spec.kernel, &kernel);
+    let kernel = plan.dest_path(spec.kernel(), &target);
+    plan.copy(spec.kernel(), &kernel);
     lines.push(format!("kernel={} {}", file_name(&kernel), spec.cmdline()));
 
-    if let Some(initrd) = &spec.initrd {
+    if let Some(initrd) = spec.initrd() {
         let dest = plan.dest_path(initrd, &target);
         plan.copy(initrd, &dest);
         lines.push(format!("ramdisk={}", file_name(&dest)));
@@ -202,48 +204,12 @@ fn xen_efi_files(
 
     plan.write(&config_path, block(&lines));
 
-    Ok(uri)
+    uri
 }
 
-/// Run the generation's secrets script and put the result next to the kernels.
-/// A failure here is not fatal: old generations routinely no longer have the
-/// secrets they were built with.
-fn build_secrets(
-    plan: &mut Plan,
-    spec: &BootSpec,
-    secrets: &Path,
-    label: &str,
-) -> Result<Option<PathBuf>, InstallError> {
-    let name = format!("{}-secrets", file_name(&spec.toplevel));
-    let dest = plan.install_dir().join(KERNELS).join(&name);
-
-    let previous = process::umask(Mode::from_bits_truncate(0o137));
-    let tmp = std::env::temp_dir().join(format!("{}-{name}", std::process::id()));
-
-    let failure = match cmd::run(Command::new(secrets).arg(&tmp)) {
-        Ok(output) if output.status.success() => None,
-        Ok(output) => Some(output.text),
-        Err(error) => Some(error.to_string()),
-    };
-
-    if let Some(reason) = failure {
-        eprintln!(
-            "warning: failed to create initrd secrets for {label:?}: {}",
-            reason.trim()
-        );
-        println!("note: if this is an older generation there is nothing to worry about");
-    }
-
-    // read it out and drop it rather than leaving secrets in /tmp until apply
-    let built = tmp.exists();
-    if built {
-        let contents = fs::read(&tmp).context(ReadSnafu { path: &tmp })?;
-        fs::remove_file(&tmp).context(RemoveSnafu { path: &tmp })?;
-        plan.write(&dest, contents);
-    }
-
-    process::umask(previous);
-    Ok(built.then_some(dest))
+/// Ask for a file and get back the URI limine.conf names it by.
+fn copy(plan: &mut Plan, facts: &Facts, path: &Path, target: &str) -> String {
+    plan.copied_uri(path, target, facts.digest(path))
 }
 
 fn block(lines: &[String]) -> String {
@@ -259,99 +225,31 @@ fn file_name(path: &Path) -> String {
         .into_owned()
 }
 
-fn built_at(link: &Path) -> Result<String, InstallError> {
-    let mtime = fs::symlink_metadata(link)
-        .context(ReadSnafu { path: link })?
-        .mtime();
-
-    let stamp = Timestamp::from_second(mtime).unwrap_or(Timestamp::UNIX_EPOCH);
-    Ok(stamp
-        .to_zoned(TimeZone::system())
-        .strftime("%F %H:%M:%S")
-        .to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::generate;
-    use crate::install::{plan::Plan, profiles::Profiles};
-    use std::{fs, path::PathBuf};
-    use tempfile::TempDir;
+    use crate::install::{
+        facts::{Facts, fixture},
+        plan::Plan,
+    };
 
-    /// A profile tree with one generation, over a stand-in for the store so
-    /// that copied files get the same `<hash>-<name>` treatment they would in
-    /// the real one.
-    struct Fixture {
-        dir: TempDir,
-    }
+    const TOPLEVEL: &str = "/nix/store/aaa-system";
+    const KERNEL: &str = "/nix/store/bbb-linux/Image";
+    const INITRD: &str = "/nix/store/ccc-initrd/initrd";
+    const MULTIBOOT: &str = "/nix/store/eee-xen/xen";
+    const XEN_EFI: &str = "/nix/store/eee-xen/xen.efi";
 
-    impl Fixture {
-        fn new() -> Self {
-            Self {
-                dir: TempDir::new().expect("temp dir"),
-            }
-        }
-
-        fn store(&self) -> PathBuf {
-            self.dir.path().join("store")
-        }
-
-        /// Give the store a file at `<name>/<file>`, so it can be hashed.
-        fn store_file(&self, name: &str, file: &str, contents: &[u8]) {
-            let dir = self.store().join(name);
-            fs::create_dir_all(&dir).expect("mkdir");
-            fs::write(dir.join(file), contents).expect("write");
-        }
-
-        /// Install `boot_json` as generation 1 of the system profile.
-        fn generation(&self, boot_json: &str) {
-            let toplevel = self.dir.path().join("toplevel");
-            fs::create_dir_all(&toplevel).expect("mkdir");
-            fs::write(toplevel.join("boot.json"), boot_json).expect("boot.json");
-
-            let profiles = self.dir.path().join("profiles");
-            fs::create_dir_all(&profiles).expect("mkdir");
-            std::os::unix::fs::symlink(&toplevel, profiles.join("system-1-link")).expect("symlink");
-        }
-
-        fn plan(&self, validate_checksums: bool) -> Plan {
-            Plan::new(&self.dir.path().join("boot/limine"), validate_checksums)
-        }
-
-        fn render_with(&self, plan: &mut Plan, expanded: bool) -> String {
-            generate(
-                plan,
-                &Profiles::new(&self.dir.path().join("profiles")),
-                "system",
-                1,
-                false,
-                expanded,
-            )
-            .expect("entries")
-        }
-
-        fn render(&self, expanded: bool) -> String {
-            self.render_with(&mut self.plan(false), expanded)
-        }
-    }
-
-    fn boot_json(fixture: &Fixture, specialisations: &str) -> String {
-        boot_json_with(fixture, specialisations, "")
-    }
-
-    fn boot_json_with(fixture: &Fixture, specialisations: &str, extension: &str) -> String {
-        let store = fixture.store().display().to_string();
-
+    fn boot_json(specialisations: &str, extension: &str) -> String {
         format!(
             r#"{{
               "org.nixos.bootspec.v1": {{
-                "init": "/nix/store/aaa-finix-system/init",
-                "initrd": "{store}/ccc-initrd/initrd",
-                "kernel": "{store}/bbb-linux/Image",
+                "init": "{TOPLEVEL}/init",
+                "initrd": "{INITRD}",
+                "kernel": "{KERNEL}",
                 "kernelParams": ["console=ttyAMA0", "quiet"],
-                "label": "finix (Linux 6.18.50)",
+                "label": "NixOS (Linux 6.18.50)",
                 "system": "aarch64-linux",
-                "toplevel": "/nix/store/aaa-finix-system"
+                "toplevel": "{TOPLEVEL}"
               }},
               "org.nixos.specialisation.v1": {{{specialisations}}}
               {extension}
@@ -359,50 +257,52 @@ mod tests {
         )
     }
 
-    fn specialisation(fixture: &Fixture) -> String {
+    const SPECIALISATION: &str = r#""hardened": {
+      "org.nixos.bootspec.v1": {
+        "init": "/nix/store/ddd-hardened/init",
+        "kernel": "/nix/store/bbb-linux/Image",
+        "kernelParams": ["lockdown=1"],
+        "label": "NixOS hardened",
+        "system": "aarch64-linux",
+        "toplevel": "/nix/store/ddd-hardened"
+      },
+      "org.nixos.specialisation.v1": {}
+    }"#;
+
+    fn xen_extension() -> String {
         format!(
-            r#""hardened": {{
-              "org.nixos.bootspec.v1": {{
-                "init": "/nix/store/ddd-hardened/init",
-                "kernel": "{}/bbb-linux/Image",
-                "kernelParams": ["lockdown=1"],
-                "label": "finix hardened",
-                "system": "aarch64-linux",
-                "toplevel": "/nix/store/ddd-hardened"
-              }},
-              "org.nixos.specialisation.v1": {{}}
-            }}"#,
-            fixture.store().display()
+            r#", "org.xenproject.bootspec.v2": {{
+              "version": "4.19",
+              "params": ["dom0_mem=4G", "ucode=scan"],
+              "multibootPath": "{MULTIBOOT}",
+              "efiPath": "{XEN_EFI}"
+            }}"#
         )
     }
 
-    /// Everything but the `built on` timestamp, which is the generation
-    /// symlink's mtime.
-    fn without_timestamp(entries: &str) -> String {
-        entries
-            .lines()
-            .map(|line| match line.split_once(", built on ") {
-                Some((head, _)) => format!("{head}, built on <time>"),
-                None => line.to_owned(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+    fn render(facts: &Facts, efi_support: bool, expanded: bool) -> String {
+        let mut plan = Plan::new(std::path::Path::new("/boot/limine"));
+        let generation = &facts.profiles()[0].generations()[0];
+
+        generate(&mut plan, facts, generation, efi_support, expanded).expect("entries")
+    }
+
+    fn one(boot_json: &str) -> Facts {
+        fixture::system(vec![fixture::generation(1, boot_json)])
     }
 
     #[test]
     fn renders_a_generation_as_one_entry() {
-        let fixture = Fixture::new();
-        fixture.generation(&boot_json(&fixture, ""));
-
         assert_eq!(
-            without_timestamp(&fixture.render(false)),
+            render(&one(&boot_json("", "")), false, false),
             "\
 //Generation 1
 protocol: linux
-comment: finix (Linux 6.18.50), built on <time>
+comment: NixOS (Linux 6.18.50), built on 2026-09-21 00:00:00
 kernel_path: boot():/limine/kernels/bbb-linux-Image
-cmdline: init=/nix/store/aaa-finix-system/init console=ttyAMA0 quiet
-module_path: boot():/limine/kernels/ccc-initrd-initrd"
+cmdline: init=/nix/store/aaa-system/init console=ttyAMA0 quiet
+module_path: boot():/limine/kernels/ccc-initrd-initrd
+"
         );
     }
 
@@ -410,10 +310,7 @@ module_path: boot():/limine/kernels/ccc-initrd-initrd"
     /// its own entry becomes "Default", and everything drops a level.
     #[test]
     fn renders_specialisations_as_a_submenu() {
-        let fixture = Fixture::new();
-        fixture.generation(&boot_json(&fixture, &specialisation(&fixture)));
-
-        let entries = without_timestamp(&fixture.render(true));
+        let entries = render(&one(&boot_json(SPECIALISATION, "")), false, true);
         let lines: Vec<&str> = entries.lines().collect();
 
         assert_eq!(lines[0], "//+Generation 1");
@@ -422,57 +319,47 @@ module_path: boot():/limine/kernels/ccc-initrd-initrd"
         assert!(entries.contains("cmdline: init=/nix/store/ddd-hardened/init lockdown=1"));
     }
 
-    /// The newest generation in the menu is the expanded one; the rest are not.
     #[test]
     fn only_the_newest_generation_is_expanded() {
-        let fixture = Fixture::new();
-        fixture.generation(&boot_json(&fixture, &specialisation(&fixture)));
+        let facts = one(&boot_json(SPECIALISATION, ""));
 
-        assert!(fixture.render(true).starts_with("//+Generation 1"));
-        assert!(fixture.render(false).starts_with("//Generation 1"));
+        assert!(render(&facts, false, true).starts_with("//+Generation 1"));
+        assert!(render(&facts, false, false).starts_with("//Generation 1"));
     }
 
-    /// With checksums on, every referenced file carries a blake2b digest that
-    /// limine verifies before booting it.
+    /// With checksums on, every referenced file carries a digest limine
+    /// verifies before booting it.
     #[test]
     fn appends_digests_when_checksums_are_on() {
-        let fixture = Fixture::new();
-        fixture.generation(&boot_json(&fixture, ""));
-        fixture.store_file("bbb-linux", "Image", b"kernel");
-        fixture.store_file("ccc-initrd", "initrd", b"initrd");
+        let facts =
+            fixture::with_digests(one(&boot_json("", "")), &[(KERNEL, "aaa"), (INITRD, "bbb")]);
 
-        let entries = fixture.render_with(&mut fixture.plan(true), false);
+        let entries = render(&facts, false, false);
 
-        let digest = entries
-            .lines()
-            .find_map(|line| line.strip_prefix("kernel_path: "))
-            .and_then(|uri| uri.split_once('#'))
-            .map(|(_, digest)| digest.to_owned())
-            .expect("a digest");
-
-        assert_eq!(digest, crate::util::hash::blake2b(b"kernel"));
+        assert!(entries.contains("kernel_path: boot():/limine/kernels/bbb-linux-Image#aaa"));
+        assert!(entries.contains("module_path: boot():/limine/kernels/ccc-initrd-initrd#bbb"));
     }
 
-    /// A Xen extension naming a multiboot binary that is actually there.
-    fn xen(fixture: &Fixture, multiboot: bool, efi: bool) -> String {
-        let store = fixture.store();
+    /// The script ran while the facts were gathered; the entry just carries
+    /// what it produced.
+    #[test]
+    fn adds_a_secrets_module_when_the_script_produced_one() {
+        let facts = fixture::with_secrets(one(&boot_json("", "")), TOPLEVEL, b"secret");
+        let entries = render(&facts, false, false);
 
-        if multiboot {
-            fixture.store_file("eee-xen", "xen", b"multiboot");
-        }
-        if efi {
-            fixture.store_file("eee-xen", "xen.efi", b"efi");
-        }
+        assert!(
+            entries.contains("module_path: boot():/limine/kernels/kernels-aaa-system-secrets"),
+            "{entries}"
+        );
+    }
 
-        format!(
-            r#", "org.xenproject.bootspec.v2": {{
-              "version": "4.19",
-              "params": ["dom0_mem=4G", "ucode=scan"],
-              "multibootPath": "{0}/eee-xen/xen",
-              "efiPath": "{0}/eee-xen/xen.efi"
-            }}"#,
-            store.display()
-        )
+    /// An older generation that can no longer produce its secrets simply gets
+    /// no secrets module, rather than failing the install.
+    #[test]
+    fn omits_the_secrets_module_when_the_script_produced_nothing() {
+        let entries = render(&one(&boot_json("", "")), false, false);
+
+        assert!(!entries.contains("secrets"), "{entries}");
     }
 
     /// Xen loads as the executable with the kernel and initrd as modules. The
@@ -480,27 +367,24 @@ module_path: boot():/limine/kernels/ccc-initrd-initrd"
     /// argument.
     #[test]
     fn renders_a_xen_multiboot_entry() {
-        let fixture = Fixture::new();
-        let extension = xen(&fixture, true, false);
-        fixture.generation(&boot_json_with(&fixture, "", &extension));
+        let facts = fixture::with_present(one(&boot_json("", &xen_extension())), &[MULTIBOOT]);
 
-        let entries = without_timestamp(&fixture.render(false));
-        let xen_entry: Vec<&str> = entries
+        let entries = render(&facts, false, false);
+        let xen: Vec<&str> = entries
             .lines()
-            .skip_while(|line| !line.contains("with Xen"))
             .take_while(|line| *line != "//Generation 1")
             .collect();
 
         assert_eq!(
-            xen_entry,
+            xen,
             [
                 "//Generation 1 with Xen 4.19",
-                "comment: Xen 4.19 finix (Linux 6.18.50), built on <time>",
+                "comment: Xen 4.19 NixOS (Linux 6.18.50), built on 2026-09-21 00:00:00",
                 "protocol: multiboot",
                 "path: boot():/limine/xen/1/eee-xen-xen",
                 "cmdline: -- dom0_mem=4G ucode=scan",
                 "module_path: boot():/limine/kernels/bbb-linux-Image",
-                "module_string: -- init=/nix/store/aaa-finix-system/init console=ttyAMA0 quiet",
+                "module_string: -- init=/nix/store/aaa-system/init console=ttyAMA0 quiet",
                 "module_path: boot():/limine/kernels/ccc-initrd-initrd",
             ]
         );
@@ -510,22 +394,10 @@ module_path: boot():/limine/kernels/ccc-initrd-initrd"
     /// cannot find an entry point in the multiboot one (limine #482).
     #[test]
     fn renders_a_xen_efi_entry_when_efi_is_supported() {
-        let fixture = Fixture::new();
-        let extension = xen(&fixture, true, true);
-        fixture.generation(&boot_json_with(&fixture, "", &extension));
+        let facts = fixture::with_present(one(&boot_json("", &xen_extension())), &[MULTIBOOT]);
 
-        let mut plan = fixture.plan(false);
-        let entries = generate(
-            &mut plan,
-            &Profiles::new(&fixture.dir.path().join("profiles")),
-            "system",
-            1,
-            true,
-            false,
-        )
-        .expect("entries");
+        let entries = render(&facts, true, false);
 
-        // the EFI entry comes first, then the multiboot one
         assert!(
             entries.contains("//Generation 1 with Xen 4.19 EFI\n"),
             "{entries}"
@@ -535,23 +407,14 @@ module_path: boot():/limine/kernels/ccc-initrd-initrd"
     }
 
     /// Xen's EFI binary reads this beside itself, so the kernel and initrd go
-    /// in the same directory under their own names.
+    /// into the same directory under their own names.
     #[test]
     fn writes_the_xen_efi_config_beside_its_binary() {
-        let fixture = Fixture::new();
-        let extension = xen(&fixture, true, true);
-        fixture.generation(&boot_json_with(&fixture, "", &extension));
+        let facts = fixture::with_present(one(&boot_json("", &xen_extension())), &[MULTIBOOT]);
 
-        let mut plan = fixture.plan(false);
-        generate(
-            &mut plan,
-            &Profiles::new(&fixture.dir.path().join("profiles")),
-            "system",
-            1,
-            true,
-            false,
-        )
-        .expect("entries");
+        let mut plan = Plan::new(std::path::Path::new("/boot/limine"));
+        let generation = &facts.profiles()[0].generations()[0];
+        generate(&mut plan, &facts, generation, true, false).expect("entries");
 
         let written = plan
             .actions()
@@ -569,20 +432,16 @@ module_path: boot():/limine/kernels/ccc-initrd-initrd"
         assert_eq!(
             String::from_utf8(written).expect("utf8"),
             "default=nixos1\n\n[nixos1]\noptions=dom0_mem=4G ucode=scan\n\
-             kernel=bbb-linux-Image init=/nix/store/aaa-finix-system/init console=ttyAMA0 quiet\n\
+             kernel=bbb-linux-Image init=/nix/store/aaa-system/init console=ttyAMA0 quiet\n\
              ramdisk=ccc-initrd-initrd\n"
         );
     }
 
-    /// Without a multiboot binary on disk there is nothing to boot, so the
-    /// entry is listed but carries no protocol at all.
+    /// A multiboot binary that has been garbage collected leaves the entry
+    /// listed but with no protocol to boot it by.
     #[test]
-    fn a_xen_entry_with_no_multiboot_binary_carries_no_protocol() {
-        let fixture = Fixture::new();
-        let extension = xen(&fixture, false, false);
-        fixture.generation(&boot_json_with(&fixture, "", &extension));
-
-        let entries = fixture.render(false);
+    fn a_xen_entry_whose_multiboot_binary_is_gone_carries_no_protocol() {
+        let entries = render(&one(&boot_json("", &xen_extension())), false, false);
 
         assert!(
             entries.contains("//Generation 1 with Xen 4.19\n"),
@@ -592,16 +451,16 @@ module_path: boot():/limine/kernels/ccc-initrd-initrd"
         assert!(!entries.contains("protocol: efi"), "{entries}");
     }
 
-    /// Rendering asks for the kernel and initrd but must not copy them.
+    /// Rendering asks for the kernel and initrd but must not copy them, and
+    /// must not read anything either: none of these paths exist.
     #[test]
-    fn plans_the_copies_without_making_them() {
-        let fixture = Fixture::new();
-        fixture.generation(&boot_json(&fixture, ""));
+    fn performs_no_io() {
+        let facts = one(&boot_json("", ""));
+        let mut plan = Plan::new(std::path::Path::new("/boot/limine"));
+        let generation = &facts.profiles()[0].generations()[0];
 
-        let mut plan = fixture.plan(false);
-        fixture.render_with(&mut plan, false);
+        generate(&mut plan, &facts, generation, false, false).expect("entries");
 
         assert_eq!(plan.actions().len(), 2);
-        assert!(!fixture.dir.path().join("boot/limine").exists());
     }
 }

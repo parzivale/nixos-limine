@@ -1,18 +1,28 @@
-use super::error::{InstallError, NoSecureBootKeysSnafu, ReadSnafu};
+//! Signing the EFI binary with sbctl.
+//!
+//! Deciding what sbctl has to be told is a function of the module's settings
+//! and whether keys already exist; running it is the caller's job.
+
+use super::error::{InstallError, NoSecureBootKeysSnafu};
 use crate::{
     config::{KeyPolicy, SecureBoot},
-    util::cmd,
+    util::cmd::Invocation,
 };
 use snafu::{ResultExt as _, ensure};
-use std::{fs, io, path::Path, process::Command};
+use std::{fs, io, path::Path};
 
-/// Where sbctl keeps the keys it generates. Passed in rather than reached for
-/// directly, so that tests can decide whether keys already exist.
+/// Where sbctl keeps the keys it generates.
 pub(crate) const STATE: &str = "/var/lib/sbctl";
 
-/// Fail before we touch the boot filesystem if the keys we were told to use do
-/// not exist.
-pub(crate) fn check(secure_boot: &SecureBoot, state: &Path) -> Result<(), InstallError> {
+/// Whether sbctl already holds keys. Read once, up front, so that everything
+/// below is a function of it.
+pub(crate) fn keys_exist(state: &Path) -> bool {
+    state.exists()
+}
+
+/// Fail before we touch the boot filesystem if the keys we were told to use
+/// do not exist.
+pub(crate) fn check(secure_boot: &SecureBoot, keys_exist: bool) -> Result<(), InstallError> {
     let SecureBoot::Enabled {
         keys: KeyPolicy::Require,
         ..
@@ -21,63 +31,66 @@ pub(crate) fn check(secure_boot: &SecureBoot, state: &Path) -> Result<(), Instal
         return Ok(());
     };
 
-    ensure!(state.exists(), NoSecureBootKeysSnafu);
+    ensure!(keys_exist, NoSecureBootKeysSnafu);
     Ok(())
 }
 
-/// Sign the EFI binary we just installed, generating and enrolling keys first
-/// if that is what the module asked for.
-pub(crate) fn sign(
+/// What sbctl has to be told, in order: generate and enrol keys if that is
+/// what the module asked for and there are none, then sign limine, then sign
+/// fwupd's own EFI binaries so that firmware updates keep working.
+pub(crate) fn commands(
     secure_boot: &SecureBoot,
     binary: &Path,
-    state: &Path,
-) -> Result<(), InstallError> {
-    let SecureBoot::Enabled { sbctl, keys, fwupd } = secure_boot else {
-        return Ok(());
+    keys_exist: bool,
+    fwupd_binaries: &[std::path::PathBuf],
+) -> Vec<Invocation> {
+    let SecureBoot::Enabled { sbctl, keys, .. } = secure_boot else {
+        return Vec::new();
     };
 
-    if !state.exists()
-        && let KeyPolicy::Generate { enroll } = keys
-    {
-        println!("auto generating keys");
-        cmd::run(Command::new(sbctl).arg("create-keys"))?.success()?;
+    let mut commands = Vec::new();
+
+    if !keys_exist && let KeyPolicy::Generate { enroll } = keys {
+        commands.push(Invocation::new(sbctl).arg("create-keys"));
 
         if let Some(extra) = enroll {
-            cmd::run(Command::new(sbctl).arg("enroll-keys").args(extra))?.success()?;
+            commands.push(Invocation::new(sbctl).arg("enroll-keys").args(extra));
         }
     }
 
-    println!("signing limine...");
-    cmd::run(Command::new(sbctl).arg("sign").arg(binary))?.success()?;
+    commands.push(Invocation::new(sbctl).arg("sign").arg(binary));
 
-    for binary in fwupd
-        .as_deref()
-        .map(efi_binaries)
-        .transpose()?
-        .unwrap_or_default()
-    {
-        println!(
-            "signing fwupd: {}",
-            binary.file_name().unwrap_or_default().to_string_lossy()
-        );
-        cmd::run(Command::new(sbctl).arg("sign").arg(&binary))?.success()?;
-    }
+    commands.extend(
+        fwupd_binaries
+            .iter()
+            .map(|binary| Invocation::new(sbctl).arg("sign").arg(binary)),
+    );
 
-    Ok(())
+    commands
 }
 
-fn efi_binaries(fwupd: &Path) -> Result<Vec<std::path::PathBuf>, InstallError> {
+/// fwupd's EFI binaries, which are signed alongside limine's. An fwupd
+/// without any is not an error.
+pub(crate) fn fwupd_binaries(
+    fwupd: Option<&Path>,
+) -> Result<Vec<std::path::PathBuf>, InstallError> {
+    let Some(fwupd) = fwupd else {
+        return Ok(Vec::new());
+    };
+
     let dir = fwupd.join("libexec/fwupd/efi");
 
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).context(ReadSnafu { path: dir }),
+        Err(error) => return Err(error).context(super::error::ReadSnafu { path: dir }),
     };
 
     let mut binaries = Vec::new();
     for entry in entries {
-        let path = entry.context(ReadSnafu { path: &dir })?.path();
+        let path = entry
+            .context(super::error::ReadSnafu { path: &dir })?
+            .path();
 
         if path.extension().is_some_and(|extension| extension == "efi") {
             binaries.push(path);
@@ -90,163 +103,102 @@ fn efi_binaries(fwupd: &Path) -> Result<Vec<std::path::PathBuf>, InstallError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, sign};
+    use super::{check, commands};
     use crate::config::{KeyPolicy, SecureBoot};
-    use std::{fs, os::unix::fs::PermissionsExt as _, path::Path, path::PathBuf};
-    use tempfile::TempDir;
+    use std::path::{Path, PathBuf};
 
-    /// An sbctl that records how it was called instead of touching any keys.
-    struct Fake {
-        dir: TempDir,
+    const SBCTL: &str = "/nix/store/aaa-sbctl/bin/sbctl";
+    const BINARY: &str = "/boot/efi/limine/BOOTAA64.EFI";
+
+    fn enabled(keys: KeyPolicy) -> SecureBoot {
+        SecureBoot::Enabled {
+            sbctl: PathBuf::from(SBCTL),
+            keys,
+            fwupd: None,
+        }
     }
 
-    impl Fake {
-        fn new() -> Self {
-            let fake = Self {
-                dir: TempDir::new().expect("temp dir"),
-            };
-
-            let script = format!(
-                "#!/bin/sh\necho \"$@\" >> {}\n",
-                fake.calls_path().display()
-            );
-
-            fs::write(fake.sbctl(), script).expect("write");
-            fs::set_permissions(fake.sbctl(), fs::Permissions::from_mode(0o755)).expect("chmod");
-
-            fake
-        }
-
-        fn sbctl(&self) -> PathBuf {
-            self.dir.path().join("sbctl")
-        }
-
-        fn calls_path(&self) -> PathBuf {
-            self.dir.path().join("calls")
-        }
-
-        /// One line per invocation, in order.
-        fn calls(&self) -> Vec<String> {
-            fs::read_to_string(self.calls_path())
-                .unwrap_or_default()
-                .lines()
-                .map(str::to_owned)
-                .collect()
-        }
-
-        /// A state directory that does or does not already hold keys.
-        fn state(&self, exists: bool) -> PathBuf {
-            let state = self.dir.path().join("state");
-
-            if exists {
-                fs::create_dir_all(&state).expect("mkdir");
-            }
-
-            state
-        }
-
-        fn enabled(&self, keys: KeyPolicy, fwupd: Option<PathBuf>) -> SecureBoot {
-            SecureBoot::Enabled {
-                sbctl: self.sbctl(),
-                keys,
-                fwupd,
-            }
-        }
-
-        /// An fwupd store path with EFI binaries in it, and a decoy.
-        fn fwupd(&self) -> PathBuf {
-            let fwupd = self.dir.path().join("fwupd");
-            let efi = fwupd.join("libexec/fwupd/efi");
-
-            fs::create_dir_all(&efi).expect("mkdir");
-            fs::write(efi.join("fwupdx64.efi"), "").expect("write");
-            fs::write(efi.join("fwupd.efi"), "").expect("write");
-            fs::write(efi.join("notes.txt"), "").expect("write");
-
-            fwupd
-        }
+    /// One line per invocation, as `program arg arg`.
+    fn lines(secure_boot: &SecureBoot, keys_exist: bool, fwupd: &[PathBuf]) -> Vec<String> {
+        commands(secure_boot, Path::new(BINARY), keys_exist, fwupd)
+            .iter()
+            .map(|invocation| format!("{invocation:?}"))
+            .map(|debug| {
+                debug
+                    .replace(SBCTL, "sbctl")
+                    .replace('"', "")
+                    .replace("Invocation { program: ", "")
+                    .replace(", args: [", " ")
+                    .replace("] }", "")
+                    .replace(',', "")
+            })
+            .collect()
     }
 
     #[test]
-    fn disabled_secure_boot_does_nothing() {
-        let fake = Fake::new();
-
-        check(&SecureBoot::Disabled, &fake.state(false)).expect("no check");
-        sign(
-            &SecureBoot::Disabled,
-            Path::new("/boot/x.efi"),
-            &fake.state(false),
-        )
-        .expect("no signing");
-
-        assert!(fake.calls().is_empty());
+    fn disabled_secure_boot_runs_nothing() {
+        assert!(lines(&SecureBoot::Disabled, false, &[]).is_empty());
+        check(&SecureBoot::Disabled, false).expect("no check");
     }
 
     /// Keys we were told already exist, and do not: refuse before anything is
     /// written to the ESP.
     #[test]
     fn requiring_keys_fails_when_there_are_none() {
-        let fake = Fake::new();
-        let secure_boot = fake.enabled(KeyPolicy::Require, None);
+        let secure_boot = enabled(KeyPolicy::Require);
 
-        let error = check(&secure_boot, &fake.state(false)).unwrap_err();
+        let error = check(&secure_boot, false).unwrap_err();
         assert!(error.to_string().contains("no sbctl secure boot keys"));
 
-        check(&secure_boot, &fake.state(true)).expect("keys are there");
+        check(&secure_boot, true).expect("keys are there");
     }
 
     /// Generation is allowed to find nothing, so the check passes either way.
     #[test]
     fn generating_keys_never_fails_the_check() {
-        let fake = Fake::new();
-        let generate = fake.enabled(KeyPolicy::Generate { enroll: None }, None);
-
-        check(&generate, &fake.state(false)).expect("will generate");
+        check(&enabled(KeyPolicy::Generate { enroll: None }), false).expect("will generate");
     }
 
     #[test]
     fn signs_without_generating_when_keys_are_already_there() {
-        let fake = Fake::new();
-        let secure_boot = fake.enabled(KeyPolicy::Generate { enroll: None }, None);
+        let secure_boot = enabled(KeyPolicy::Generate { enroll: None });
 
-        sign(&secure_boot, Path::new("/boot/x.efi"), &fake.state(true)).expect("sign");
-
-        assert_eq!(fake.calls(), ["sign /boot/x.efi"]);
+        assert_eq!(
+            lines(&secure_boot, true, &[]),
+            [format!("sbctl sign {BINARY}")]
+        );
     }
 
     #[test]
     fn generates_keys_before_signing_when_there_are_none() {
-        let fake = Fake::new();
-        let secure_boot = fake.enabled(KeyPolicy::Generate { enroll: None }, None);
+        let secure_boot = enabled(KeyPolicy::Generate { enroll: None });
 
-        sign(&secure_boot, Path::new("/boot/x.efi"), &fake.state(false)).expect("sign");
-
-        assert_eq!(fake.calls(), ["create-keys", "sign /boot/x.efi"]);
+        assert_eq!(
+            lines(&secure_boot, false, &[]),
+            [
+                "sbctl create-keys".to_owned(),
+                format!("sbctl sign {BINARY}")
+            ]
+        );
     }
 
     /// Enrolment only happens on the generation path, and carries the extra
     /// arguments the module set.
     #[test]
     fn enrols_generated_keys_with_the_configured_arguments() {
-        let fake = Fake::new();
-        let secure_boot = fake.enabled(
-            KeyPolicy::Generate {
-                enroll: Some(vec![
-                    "--microsoft".to_owned(),
-                    "--firmware-builtin".to_owned(),
-                ]),
-            },
-            None,
-        );
-
-        sign(&secure_boot, Path::new("/boot/x.efi"), &fake.state(false)).expect("sign");
+        let secure_boot = enabled(KeyPolicy::Generate {
+            enroll: Some(vec![
+                "--microsoft".to_owned(),
+                "--firmware-builtin".to_owned(),
+            ]),
+        });
 
         assert_eq!(
-            fake.calls(),
+            lines(&secure_boot, false, &[]),
             [
-                "create-keys",
-                "enroll-keys --microsoft --firmware-builtin",
-                "sign /boot/x.efi",
+                "sbctl create-keys".to_owned(),
+                "sbctl enroll-keys --microsoft --firmware-builtin".to_owned(),
+                format!("sbctl sign {BINARY}"),
             ]
         );
     }
@@ -254,66 +206,32 @@ mod tests {
     /// Keys that already exist are never re-enrolled.
     #[test]
     fn does_not_enrol_over_existing_keys() {
-        let fake = Fake::new();
-        let secure_boot = fake.enabled(
-            KeyPolicy::Generate {
-                enroll: Some(vec!["--microsoft".to_owned()]),
-            },
-            None,
+        let secure_boot = enabled(KeyPolicy::Generate {
+            enroll: Some(vec!["--microsoft".to_owned()]),
+        });
+
+        assert_eq!(
+            lines(&secure_boot, true, &[]),
+            [format!("sbctl sign {BINARY}")]
         );
-
-        sign(&secure_boot, Path::new("/boot/x.efi"), &fake.state(true)).expect("sign");
-
-        assert_eq!(fake.calls(), ["sign /boot/x.efi"]);
     }
 
     /// fwupd's own EFI binaries have to be signed too, or firmware updates
-    /// stop working under secure boot. Only the .efi ones.
+    /// stop working under secure boot.
     #[test]
-    fn signs_every_fwupd_efi_binary() {
-        let fake = Fake::new();
-        let secure_boot = fake.enabled(KeyPolicy::Require, Some(fake.fwupd()));
-        let fwupd = fake.fwupd();
+    fn signs_every_fwupd_efi_binary_after_limine() {
+        let fwupd = [
+            PathBuf::from("/fw/fwupd.efi"),
+            PathBuf::from("/fw/fwupdx64.efi"),
+        ];
 
-        sign(&secure_boot, Path::new("/boot/x.efi"), &fake.state(true)).expect("sign");
-
-        let efi = fwupd.join("libexec/fwupd/efi");
         assert_eq!(
-            fake.calls(),
+            lines(&enabled(KeyPolicy::Require), true, &fwupd),
             [
-                "sign /boot/x.efi".to_owned(),
-                format!("sign {}", efi.join("fwupd.efi").display()),
-                format!("sign {}", efi.join("fwupdx64.efi").display()),
+                format!("sbctl sign {BINARY}"),
+                "sbctl sign /fw/fwupd.efi".to_owned(),
+                "sbctl sign /fw/fwupdx64.efi".to_owned(),
             ]
         );
-    }
-
-    /// An fwupd without an EFI directory is not an error.
-    #[test]
-    fn tolerates_an_fwupd_with_no_efi_binaries() {
-        let fake = Fake::new();
-        let secure_boot = fake.enabled(KeyPolicy::Require, Some(fake.dir.path().join("absent")));
-
-        sign(&secure_boot, Path::new("/boot/x.efi"), &fake.state(true)).expect("sign");
-
-        assert_eq!(fake.calls(), ["sign /boot/x.efi"]);
-    }
-
-    /// A failing sbctl has to stop the install, not be shrugged off the way
-    /// the python script did.
-    #[test]
-    fn a_failing_sbctl_fails_the_install() {
-        let fake = Fake::new();
-        fs::write(
-            fake.sbctl(),
-            "#!/bin/sh\necho 'sbctl: setup mode disabled' >&2\nexit 1\n",
-        )
-        .expect("write");
-        fs::set_permissions(fake.sbctl(), fs::Permissions::from_mode(0o755)).expect("chmod");
-
-        let secure_boot = fake.enabled(KeyPolicy::Require, None);
-        let error = sign(&secure_boot, Path::new("/boot/x.efi"), &fake.state(true)).unwrap_err();
-
-        assert!(error.to_string().contains("failed"), "{error}");
     }
 }

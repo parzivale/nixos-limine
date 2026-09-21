@@ -10,32 +10,70 @@ use these::These;
 #[derive(Debug, Deserialize)]
 #[serde(try_from = "Raw")]
 pub(crate) struct LimineInstallConfig {
-    pub limine_path: PathBuf,
-    pub arch: Arch,
+    pub(super) limine_path: PathBuf,
+    pub(super) arch: Arch,
     /// `efiMountPoint`; used unconditionally by the additionalFiles copy loop.
-    pub mount_point: PathBuf,
+    pub(super) mount_point: PathBuf,
     /// Where limine.conf, the stage 2 binary and the copied kernels go: on the
     /// ESP when EFI is enabled, otherwise `/boot/limine`. Resolved during
     /// validation, which is also where a non-FAT `/boot` is rejected.
-    pub install_dir: PathBuf,
+    pub(super) install_dir: PathBuf,
 
     /// EFI, BIOS, or hybrid. Use `.as_ref().here()` / `.as_ref().there()`.
-    pub target: These<EfiInstall, BiosConfig>,
+    pub(super) target: These<EfiInstall, BiosConfig>,
 
     /// Append a blake2b digest to every `boot():` URI we emit.
-    pub validate_checksums: bool,
+    pub(super) validate_checksums: bool,
     /// `None` = unlimited (wire value 0).
-    pub max_generations: Option<u32>,
+    pub(super) max_generations: Option<u32>,
 
     /// limine.conf's global section, verbatim. Rendered in key order, with
     /// `default_entry` appended when the module did not set it.
-    pub settings: BTreeMap<String, Setting>,
-    pub extra_entries: String,
+    pub(super) settings: BTreeMap<String, Setting>,
+    pub(super) extra_entries: String,
     /// dest (relative to `mount_point`) -> source path
-    pub additional_files: BTreeMap<String, PathBuf>,
+    pub(super) additional_files: BTreeMap<String, PathBuf>,
 }
 
 impl LimineInstallConfig {
+    pub(crate) const fn arch(&self) -> Arch {
+        self.arch
+    }
+
+    /// The ESP, or wherever the module pointed us.
+    pub(crate) fn mount_point(&self) -> &Path {
+        &self.mount_point
+    }
+
+    pub(crate) fn install_dir(&self) -> &Path {
+        &self.install_dir
+    }
+
+    pub(crate) const fn target(&self) -> &These<EfiInstall, BiosConfig> {
+        &self.target
+    }
+
+    pub(crate) const fn validate_checksums(&self) -> bool {
+        self.validate_checksums
+    }
+
+    pub(crate) const fn max_generations(&self) -> Option<u32> {
+        self.max_generations
+    }
+
+    pub(crate) const fn settings(&self) -> &BTreeMap<String, Setting> {
+        &self.settings
+    }
+
+    pub(crate) fn extra_entries(&self) -> &str {
+        &self.extra_entries
+    }
+
+    /// dest (relative to the mount point) -> source path
+    pub(crate) const fn additional_files(&self) -> &BTreeMap<String, PathBuf> {
+        &self.additional_files
+    }
+
     /// limine's own tool, which deploys stage 1 and enrols the config hash.
     pub(crate) fn limine_binary(&self) -> PathBuf {
         self.limine_path.join("bin/limine")
@@ -62,6 +100,23 @@ impl LimineInstallConfig {
     }
 
     /// `None` when there is no ESP, or when signing was not asked for.
+    /// Whether the install will write a firmware boot entry, which is the
+    /// only reason it needs to know which partition the ESP is on.
+    /// fwupd's store path, whose EFI binaries are signed alongside ours.
+    pub(crate) fn fwupd(&self) -> Option<&Path> {
+        match self.target.as_ref().here().map(|efi| &efi.secure_boot) {
+            Some(SecureBoot::Enabled { fwupd, .. }) => fwupd.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn registers_boot_entry(&self) -> bool {
+        self.target
+            .as_ref()
+            .here()
+            .is_some_and(|efi| matches!(efi.discovery, EfiDiscovery::Registered))
+    }
+
     pub(crate) fn secure_boot(&self) -> Option<&SecureBoot> {
         self.target.as_ref().here().map(|efi| &efi.secure_boot)
     }
@@ -107,10 +162,10 @@ impl fmt::Display for Arch {
 /// hangs off here rather than off the top-level config.
 #[derive(Debug)]
 pub(crate) struct EfiInstall {
-    pub discovery: EfiDiscovery,
+    pub(super) discovery: EfiDiscovery,
     /// Hash limine.conf and hand it to `limine enroll-config`.
-    pub enroll_config: bool,
-    pub secure_boot: SecureBoot,
+    pub(super) enroll_config: bool,
+    pub(super) secure_boot: SecureBoot,
 }
 
 /// How limine is made discoverable by EFI firmware.
@@ -138,6 +193,18 @@ impl EfiDiscovery {
 }
 
 impl EfiInstall {
+    pub(crate) const fn discovery(&self) -> &EfiDiscovery {
+        &self.discovery
+    }
+
+    pub(crate) const fn enroll_config(&self) -> bool {
+        self.enroll_config
+    }
+
+    pub(crate) const fn secure_boot(&self) -> &SecureBoot {
+        &self.secure_boot
+    }
+
     /// Where limine's EFI binary goes on the ESP.
     pub(crate) fn image_path(&self, mount_point: &Path, boot_file: &str) -> PathBuf {
         mount_point
@@ -155,15 +222,36 @@ pub(crate) struct BiosConfig {
     pub stage1: Option<Stage1>,
 }
 
+impl BiosConfig {
+    /// `None` when the module said `nodev`.
+    pub(crate) const fn stage1(&self) -> Option<&Stage1> {
+        self.stage1.as_ref()
+    }
+}
+
 /// Deploying limine's stage 1 to a disk. All three fields are only ever
 /// `limine bios-install` arguments, so they live or die together.
 #[derive(Debug)]
 pub(crate) struct Stage1 {
-    pub device: PathBuf,
+    pub(super) device: PathBuf,
     /// 1-based index of the dedicated stage 2 partition, if any.
-    pub partition_index: Option<u32>,
+    pub(super) partition_index: Option<u32>,
     /// Pass `--force`, overriding limine's own safety checks.
-    pub force: bool,
+    pub(super) force: bool,
+}
+
+impl Stage1 {
+    pub(crate) fn device(&self) -> &Path {
+        &self.device
+    }
+
+    pub(crate) const fn partition_index(&self) -> Option<u32> {
+        self.partition_index
+    }
+
+    pub(crate) const fn force(&self) -> bool {
+        self.force
+    }
 }
 
 /// Signing the EFI binary with sbctl. Only reachable through [`EfiInstall`],

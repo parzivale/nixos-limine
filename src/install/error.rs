@@ -62,6 +62,9 @@ pub(crate) enum InstallError {
     /// The ESP could not be traced back to a device.
     #[snafu(display("{source}"), context(false))]
     Mountinfo { source: MountinfoError },
+    /// A boot entry was asked for without knowing where the ESP is.
+    #[snafu(display("the ESP was never located, so no boot entry can name it"))]
+    NoEsp,
     /// sysfs does not say which disk and partition the ESP device is.
     #[snafu(display("could not work out which partition {} is", path.display()))]
     UnknownPartition { path: PathBuf },

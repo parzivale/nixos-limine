@@ -321,6 +321,7 @@ dependencies = [
  "snafu",
  "tempfile",
  "these",
+ "uuid",
 ]
 
 [[package]]

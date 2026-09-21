@@ -36,21 +36,34 @@
         )
       );
 
-      devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell {
-          name = "limine-install";
+      devShells = forAllSystems (
+        pkgs:
+        let
+          # nixpkgs' rustc ships no llvm-tools-preview, so cargo-llvm-cov has
+          # to be pointed at an llvm matching the one rustc was built with.
+          llvm = pkgs.llvmPackages_21.llvm;
+        in
+        {
+          default = pkgs.mkShell {
+            name = "limine-install";
 
-          packages = [
-            pkgs.cargo
-            pkgs.rustc
-            pkgs.clippy
-            pkgs.rustfmt
-            pkgs.rust-analyzer
-          ];
+            packages = [
+              pkgs.cargo
+              pkgs.rustc
+              pkgs.clippy
+              pkgs.rustfmt
+              pkgs.rust-analyzer
+              pkgs.cargo-llvm-cov
+            ];
 
-          env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
-        };
-      });
+            env = {
+              RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+              LLVM_COV = "${llvm}/bin/llvm-cov";
+              LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
+            };
+          };
+        }
+      );
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
     };

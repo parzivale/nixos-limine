@@ -14,15 +14,18 @@ pub(super) struct RawXen {
     version: Option<String>,
 }
 
-/// `None` when the extension names no version, which is how the script decides
-/// a generation has no Xen entries at all.
+/// `None` when the extension names no version, which is how the script
+/// decides a generation has no Xen entries at all.
+///
+/// Whether the multiboot binary is still on disk is not asked here: that is a
+/// fact about the world, and is gathered with the others.
 pub(super) fn resolve(r: RawXen) -> Option<Xen> {
     Some(Xen {
         version: r.version?,
         params: r.params,
         boot: r
             .multiboot_path
-            .filter(|path| !path.as_os_str().is_empty() && path.exists())
+            .filter(|path| !path.as_os_str().is_empty())
             .map(|multiboot| XenBoot {
                 multiboot,
                 efi: r.efi_path,
