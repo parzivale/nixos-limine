@@ -21,6 +21,11 @@
       boot.loader.limine.efiInstallAsRemovable = true;
       boot.loader.limine.settings.timeout = 0;
 
+      # kept out of the store and appended to the initrd at install time, so
+      # the installer has to run the generation's script and hand limine the
+      # result as a second initrd
+      boot.initrd.secrets."/etc/limine-test-secret" = pkgs.writeText "secret" "hunter2";
+
       environment.systemPackages = [ pkgs.efibootmgr ];
     };
 
@@ -51,6 +56,21 @@
             "grep -E '^kernel_path: boot\\(\\):/limine/kernels/.*#[0-9a-f]{128}$'"
             " /boot/limine/limine.conf"
         )
+
+    with subtest("the initrd secrets were built and handed to limine"):
+        conf = machine.succeed("cat /boot/limine/limine.conf")
+
+        # the initrd, then the secrets appended to it
+        modules = [line for line in conf.splitlines() if line.startswith("module_path:")]
+        assert len(modules) == 2, conf
+
+        # a uri is boot():<path>#<digest>, and only the path is a filename
+        named = modules[1].split("/")[-1].split("#")[0]
+        assert named.endswith("-secrets"), modules
+
+        # exactly one: key material has no business being copied twice
+        secrets = machine.succeed("ls /boot/limine/kernels/ | grep -- -secrets").split()
+        assert secrets == [named], (secrets, named)
 
     with subtest("no boot entry was registered"):
         # efiInstallAsRemovable means the firmware finds it by path alone

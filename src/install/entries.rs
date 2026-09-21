@@ -81,12 +81,15 @@ fn linux_entry(
     // can no longer produce its secrets simply has none
     if let Some(secrets) = facts.secrets(spec.toplevel()) {
         let name = format!("{}-secrets", file_name(spec.toplevel()));
-        let dest = plan.install_dir().join(KERNELS).join(&name);
 
-        plan.write(&dest, secrets.to_vec());
         lines.push(format!(
             "module_path: {}",
-            plan.copied_uri(&dest, KERNELS, facts.digest(&dest))
+            plan.written_uri(
+                &name,
+                KERNELS,
+                secrets.contents().to_vec(),
+                secrets.digest()
+            )
         ));
     }
 
@@ -348,8 +351,23 @@ module_path: boot():/limine/kernels/ccc-initrd-initrd
         let entries = render(&facts, false, false);
 
         assert!(
-            entries.contains("module_path: boot():/limine/kernels/kernels-aaa-system-secrets"),
+            entries.contains("module_path: boot():/limine/kernels/aaa-system-secrets\n"),
             "{entries}"
+        );
+    }
+
+    /// With checksums on, the secrets get a digest too -- taken from the
+    /// bytes, since they were never a file in the store to read back.
+    #[test]
+    fn checksums_the_secrets_it_was_handed() {
+        let mut facts = fixture::with_secrets(one(&boot_json("", "")), TOPLEVEL, b"secret");
+        facts = fixture::with_secrets_digest(facts, TOPLEVEL, "deadbeef");
+
+        assert!(
+            render(&facts, false, false)
+                .contains("module_path: boot():/limine/kernels/aaa-system-secrets#deadbeef"),
+            "{}",
+            render(&facts, false, false)
         );
     }
 

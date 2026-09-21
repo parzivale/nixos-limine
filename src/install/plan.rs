@@ -77,6 +77,34 @@ impl Plan {
         self.install_dir().join(target).join(dest_file(path))
     }
 
+    /// Put generated contents under `target`, and return the URI limine.conf
+    /// names them by.
+    ///
+    /// Unlike [`Self::copied_uri`] the name is ours to choose, because
+    /// nothing produced these but us.
+    pub(crate) fn written_uri(
+        &mut self,
+        name: &str,
+        target: &str,
+        contents: Vec<u8>,
+        digest: Option<&str>,
+    ) -> String {
+        let to = self.install_dir.join(target).join(name);
+        self.write(&to, contents);
+
+        let mut uri = format!(
+            "boot():{}",
+            Path::new("/limine").join(target).join(name).display()
+        );
+
+        if let Some(digest) = digest {
+            uri.push('#');
+            uri.push_str(digest);
+        }
+
+        uri
+    }
+
     /// Ask for `path` under `target`, and return the URI limine.conf refers to
     /// it by. The digest is one limine verifies before booting the file, and
     /// is absent when checksums are off.

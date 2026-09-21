@@ -287,6 +287,12 @@ in
         '';
 
         system.boot.loader.id = "limine";
+
+        # the install runs the generation's append-initrd-secrets script and
+        # puts the result beside the kernel as a second initrd. Saying so is
+        # what stops NixOS baking those secrets into the initrd itself, where
+        # they would land in the world-readable store.
+        boot.loader.supportsInitrdSecrets = true;
       }
 
       (lib.mkIf cfg.secureBoot.enable {

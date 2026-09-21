@@ -27,13 +27,33 @@ pub(crate) struct Facts {
     /// Referenced files that are actually still on disk. A generation can
     /// name one that has since been garbage collected.
     present: BTreeSet<PathBuf>,
-    secrets: BTreeMap<Toplevel, Vec<u8>>,
+    secrets: BTreeMap<Toplevel, Secrets>,
     sbctl_keys_exist: bool,
     esp: Option<Partition>,
 }
 
 /// A generation's toplevel, which is what its secrets are keyed by.
 pub(crate) type Toplevel = PathBuf;
+
+/// What a generation's secrets script produced.
+///
+/// These never existed in the store -- that is the point of them -- so the
+/// digest is taken here rather than read back off a file.
+#[derive(Debug)]
+pub(crate) struct Secrets {
+    pub(super) contents: Vec<u8>,
+    pub(super) digest: Option<String>,
+}
+
+impl Secrets {
+    pub(crate) fn contents(&self) -> &[u8] {
+        &self.contents
+    }
+
+    pub(crate) fn digest(&self) -> Option<&str> {
+        self.digest.as_deref()
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct Profile {
@@ -75,8 +95,8 @@ impl Facts {
     }
 
     /// The secrets a generation's script produced, if it produced any.
-    pub(crate) fn secrets(&self, toplevel: &Path) -> Option<&[u8]> {
-        self.secrets.get(toplevel).map(Vec::as_slice)
+    pub(crate) fn secrets(&self, toplevel: &Path) -> Option<&Secrets> {
+        self.secrets.get(toplevel)
     }
 
     pub(crate) fn fwupd_binaries(&self) -> &[PathBuf] {
@@ -154,9 +174,12 @@ impl Partition {
 /// Builders for facts that were never read off a disk.
 #[cfg(test)]
 pub(crate) mod fixture {
-    use super::{Facts, Generation, Partition, Profile, SYSTEM};
+    use super::{Facts, Generation, Partition, Profile, SYSTEM, Secrets};
     use crate::install::bootspec::BootSpec;
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
 
     /// A generation whose bootspec is `boot_json`, built at a fixed time so
     /// that rendered entries can be compared verbatim.
@@ -197,6 +220,15 @@ pub(crate) mod fixture {
         }
     }
 
+    /// Pretend the secrets carry a digest, as they do when checksums are on.
+    pub(crate) fn with_secrets_digest(mut facts: Facts, toplevel: &str, digest: &str) -> Facts {
+        if let Some(secrets) = facts.secrets.get_mut(Path::new(toplevel)) {
+            secrets.digest = Some(digest.to_owned());
+        }
+
+        facts
+    }
+
     /// Pretend fwupd has these EFI binaries.
     pub(crate) fn with_fwupd(mut facts: Facts, binaries: &[PathBuf]) -> Facts {
         facts.fwupd = binaries.to_vec();
@@ -227,7 +259,13 @@ pub(crate) mod fixture {
 
     /// Pretend a generation's secrets script produced something.
     pub(crate) fn with_secrets(mut facts: Facts, toplevel: &str, contents: &[u8]) -> Facts {
-        facts.secrets = BTreeMap::from([(PathBuf::from(toplevel), contents.to_vec())]);
+        facts.secrets = BTreeMap::from([(
+            PathBuf::from(toplevel),
+            Secrets {
+                contents: contents.to_vec(),
+                digest: None,
+            },
+        )]);
         facts
     }
 }

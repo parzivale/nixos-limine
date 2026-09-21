@@ -4,7 +4,7 @@
 //! is a pure function of the config and what this found.
 
 use super::disk;
-use super::{Facts, Generation, Partition, Profile, SYSTEM};
+use super::{Facts, Generation, Partition, Profile, SYSTEM, Secrets};
 use crate::install::{
     bootspec::BootSpec,
     error::{InstallError, ParseBootSpecSnafu, ReadSnafu},
@@ -30,7 +30,7 @@ pub(crate) fn gather(
     profiles: &Profiles,
 ) -> Result<Facts, InstallError> {
     let profiles = read_profiles(cfg, profiles)?;
-    let secrets = run_secrets_scripts(&profiles)?;
+    let secrets = run_secrets_scripts(cfg, &profiles)?;
 
     let referenced = referenced(cfg, &profiles);
 
@@ -192,7 +192,10 @@ fn collect_referenced(spec: &BootSpec, paths: &mut BTreeSet<PathBuf>) {
 ///
 /// A failure is not fatal: older generations routinely no longer have the
 /// secrets they were built with.
-fn run_secrets_scripts(profiles: &[Profile]) -> Result<BTreeMap<PathBuf, Vec<u8>>, InstallError> {
+fn run_secrets_scripts(
+    cfg: &LimineInstallConfig,
+    profiles: &[Profile],
+) -> Result<BTreeMap<PathBuf, Secrets>, InstallError> {
     let mut secrets = BTreeMap::new();
 
     for profile in profiles {
@@ -203,8 +206,10 @@ fn run_secrets_scripts(profiles: &[Profile]) -> Result<BTreeMap<PathBuf, Vec<u8>
                 continue;
             };
 
-            if let Some(built) = run_secrets_script(script, spec.toplevel())? {
-                secrets.insert(spec.toplevel().to_path_buf(), built);
+            if let Some(contents) = run_secrets_script(script, spec.toplevel())? {
+                let digest = cfg.validate_checksums().then(|| hash::blake2b(&contents));
+
+                secrets.insert(spec.toplevel().to_path_buf(), Secrets { contents, digest });
             }
         }
     }
