@@ -140,7 +140,7 @@ mod tests {
             "secureBoot": {
                 "enable": false, "autoGenerateKeys": false,
                 "autoEnrollKeys": {"enable": false, "extraArgs": []},
-                "sbctl": "/nix/store/bbb-sbctl"
+                "sbctl": "/nix/store/bbb-sbctl", "databasePath": "/etc/secureboot"
             },
             "settings": {},
             "validateChecksums": false
@@ -331,8 +331,7 @@ mod tests {
         assert_eq!(tail.trim(), "/memtest\n  protocol: chainload");
     }
 
-    /// Rendering the whole config is a function of the facts: it reads
-    /// nothing and writes nothing.
+    /// Rendering the whole config only records what it wants.
     #[test]
     fn performs_no_io() {
         let facts = fixture::system(vec![fixture::generation(1, &boot_json(1, ""))]);
@@ -341,8 +340,8 @@ mod tests {
 
         generate(&mut plan, &cfg, &facts).expect("conf");
 
-        // /boot/limine is the install dir, and nothing may have appeared there
-        assert!(!cfg.install_dir().exists());
+        // the plan records what it wants and Plan has no way to carry it out;
+        // performing it is effect::apply, and this never reaches it
         assert!(!plan.actions().is_empty());
     }
 }

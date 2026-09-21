@@ -11,9 +11,6 @@ use crate::{
 use snafu::ensure;
 use std::path::Path;
 
-/// Where sbctl keeps the keys it generates.
-pub(crate) const STATE: &str = "/var/lib/sbctl";
-
 /// Fail before we touch the boot filesystem if the keys we were told to use
 /// do not exist.
 pub(crate) fn check(secure_boot: &SecureBoot, keys_exist: bool) -> Result<(), InstallError> {
@@ -75,6 +72,7 @@ mod tests {
     fn enabled(keys: KeyPolicy) -> SecureBoot {
         SecureBoot::Enabled {
             sbctl: PathBuf::from(SBCTL),
+            database: PathBuf::from("/etc/secureboot"),
             keys,
             fwupd: None,
         }

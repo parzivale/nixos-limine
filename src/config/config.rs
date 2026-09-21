@@ -110,6 +110,14 @@ impl LimineInstallConfig {
         }
     }
 
+    /// Where sbctl looks for the keys it signs with, when signing is on.
+    pub(crate) fn sbctl_database(&self) -> Option<&Path> {
+        match self.secure_boot() {
+            Some(SecureBoot::Enabled { database, .. }) => Some(database),
+            _ => None,
+        }
+    }
+
     pub(crate) fn registers_boot_entry(&self) -> bool {
         self.target
             .as_ref()
@@ -262,6 +270,9 @@ pub(crate) enum SecureBoot {
     Enabled {
         /// The `sbctl` binary itself, resolved out of its store path.
         sbctl: PathBuf,
+        /// Where that sbctl keeps its keys, which is baked into it at build
+        /// time and so cannot be read back off the package.
+        database: PathBuf,
         keys: KeyPolicy,
         /// fwupd's store path; its EFI binaries get signed too when present.
         fwupd: Option<PathBuf>,
@@ -307,7 +318,7 @@ mod tests {
             "secureBoot": {
                 "enable": false, "autoGenerateKeys": false,
                 "autoEnrollKeys": {"enable": false, "extraArgs": []},
-                "sbctl": "/nix/store/bbb-sbctl"
+                "sbctl": "/nix/store/bbb-sbctl", "databasePath": "/etc/secureboot"
             },
             "settings": {},
             "validateChecksums": true
@@ -403,7 +414,7 @@ mod tests {
             "secureBoot": {
                 "enable": true, "autoGenerateKeys": true,
                 "autoEnrollKeys": {"enable": true, "extraArgs": ["--microsoft"]},
-                "sbctl": "/nix/store/bbb-sbctl"
+                "sbctl": "/nix/store/bbb-sbctl", "databasePath": "/etc/secureboot"
             }
         }));
 
@@ -420,6 +431,39 @@ mod tests {
             enroll.as_deref(),
             Some(["--microsoft".to_owned()].as_slice())
         );
+    }
+
+    /// nixpkgs builds sbctl with its database at /etc/secureboot, not
+    /// sbctl's own /var/lib/sbctl, and the path is baked in at build time
+    /// rather than readable off the package -- so the module has to be told
+    /// and we have to look where it says.
+    #[test]
+    fn looks_for_sbctl_keys_where_the_module_says() {
+        let cfg = parse(json!({
+            "secureBoot": {
+                "enable": true, "autoGenerateKeys": false,
+                "autoEnrollKeys": {"enable": false, "extraArgs": []},
+                "sbctl": "/nix/store/bbb-sbctl", "databasePath": "/etc/secureboot"
+            }
+        }));
+
+        assert_eq!(cfg.sbctl_database(), Some(Path::new("/etc/secureboot")));
+
+        let moved = parse(json!({
+            "secureBoot": {
+                "enable": true, "autoGenerateKeys": false,
+                "autoEnrollKeys": {"enable": false, "extraArgs": []},
+                "sbctl": "/nix/store/bbb-sbctl", "databasePath": "/var/lib/sbctl"
+            }
+        }));
+
+        assert_eq!(moved.sbctl_database(), Some(Path::new("/var/lib/sbctl")));
+    }
+
+    /// Nothing to look for when signing is off.
+    #[test]
+    fn has_no_sbctl_database_without_secure_boot() {
+        assert_eq!(parse(json!({})).sbctl_database(), None);
     }
 
     /// Without an ESP, limine has to read /boot itself, so it has to be one of

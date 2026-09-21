@@ -50,7 +50,7 @@ mod tests {
             "partitionIndex": null,
             "secureBoot": {"enable": false, "autoGenerateKeys": false,
                 "autoEnrollKeys": {"enable": false, "extraArgs": []},
-                "sbctl": "/nix/store/bbb-sbctl"},
+                "sbctl": "/nix/store/bbb-sbctl", "databasePath": "/etc/secureboot"},
             "settings": {}, "validateChecksums": false
         });
 

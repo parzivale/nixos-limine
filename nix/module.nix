@@ -233,6 +233,28 @@ in
       };
 
       sbctl = lib.mkPackageOption pkgs "sbctl" { };
+
+      databasePath = lib.mkOption {
+        type = lib.types.path;
+        default = "/etc/secureboot";
+        description = ''
+          Where sbctl keeps its keys.
+
+          This has to match the path {option}`boot.loader.limine.secureBoot.sbctl`
+          was built with, which nixpkgs sets to `/etc/secureboot` rather than
+          sbctl's own `/var/lib/sbctl`. Override both together if you move it:
+
+          ```nix
+          boot.loader.limine.secureBoot = {
+            sbctl = pkgs.sbctl.override { databasePath = "/var/lib/sbctl"; };
+            databasePath = "/var/lib/sbctl";
+          };
+          ```
+
+          The install only reads it, to decide whether keys have to be
+          generated before it can sign anything.
+        '';
+      };
     };
   };
 

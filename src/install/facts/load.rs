@@ -9,7 +9,6 @@ use crate::install::{
     bootspec::BootSpec,
     error::{InstallError, ParseBootSpecSnafu, ReadSnafu},
     facts::profiles::Profiles,
-    secure_boot,
 };
 use crate::{
     config::{LimineInstallConfig, Setting},
@@ -43,7 +42,7 @@ pub(crate) fn gather(
             .collect(),
         digests: digests(cfg, &referenced)?,
         esp: esp(cfg)?,
-        sbctl_keys_exist: Path::new(secure_boot::STATE).exists(),
+        sbctl_keys_exist: cfg.sbctl_database().is_some_and(Path::exists),
         fwupd: fwupd_binaries(cfg.fwupd())?,
         profiles,
         secrets,

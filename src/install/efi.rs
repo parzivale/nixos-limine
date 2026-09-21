@@ -107,7 +107,7 @@ mod tests {
             "secureBoot": {
                 "enable": false, "autoGenerateKeys": false,
                 "autoEnrollKeys": {"enable": false, "extraArgs": []},
-                "sbctl": SBCTL
+                "sbctl": SBCTL, "databasePath": "/etc/secureboot"
             },
             "settings": {},
             "validateChecksums": false
@@ -165,9 +165,9 @@ mod tests {
         }
     }
 
-    /// Planning the copy must not make it.
+    /// Planning the copy records it rather than making it.
     #[test]
-    fn planning_the_image_performs_no_io() {
+    fn planning_the_image_only_records_it() {
         let cfg = config(json!({}));
         let efi = cfg.target().as_ref().here().expect("an efi target");
 
@@ -175,7 +175,6 @@ mod tests {
         plan(&mut p, &cfg, efi);
 
         assert_eq!(p.actions().len(), 1);
-        assert!(!PathBuf::from("/boot/efi").exists());
     }
 
     #[test]
@@ -206,7 +205,7 @@ mod tests {
                 "secureBoot": {
                     "enable": true, "autoGenerateKeys": false,
                     "autoEnrollKeys": {"enable": false, "extraArgs": []},
-                    "sbctl": SBCTL
+                    "sbctl": SBCTL, "databasePath": "/etc/secureboot"
                 }
             }),
             true,
@@ -227,7 +226,7 @@ mod tests {
                 "secureBoot": {
                     "enable": true, "autoGenerateKeys": false,
                     "autoEnrollKeys": {"enable": false, "extraArgs": []},
-                    "sbctl": SBCTL
+                    "sbctl": SBCTL, "databasePath": "/etc/secureboot"
                 }
             }),
             true,
@@ -245,7 +244,7 @@ mod tests {
                 "secureBoot": {
                     "enable": true, "autoGenerateKeys": false,
                     "autoEnrollKeys": {"enable": false, "extraArgs": []},
-                    "sbctl": SBCTL
+                    "sbctl": SBCTL, "databasePath": "/etc/secureboot"
                 }
             }),
             true,

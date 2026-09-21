@@ -10,6 +10,7 @@ pub(super) struct RawSecureBoot {
     auto_generate_keys: bool,
     auto_enroll_keys: RawAutoEnrollKeys,
     sbctl: PathBuf,
+    database_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -40,6 +41,7 @@ pub(super) fn resolve(r: &RawSecureBoot, fwupd: Option<&Path>) -> SecureBoot {
 
     SecureBoot::Enabled {
         sbctl: r.sbctl.join("bin/sbctl"),
+        database: r.database_path.clone(),
         keys,
         fwupd: fwupd.map(Path::to_path_buf),
     }

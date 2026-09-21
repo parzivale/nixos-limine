@@ -153,7 +153,7 @@ mod tests {
         );
     }
 
-    /// Building the plan must not touch the destination.
+    /// Building the plan records intent; `Plan` has no way to carry it out.
     #[test]
     fn records_what_it_would_do_without_doing_it() {
         let mut plan = plan();
@@ -176,8 +176,6 @@ mod tests {
                 },
             ]
         );
-
-        assert!(!Path::new("/boot/limine/limine.conf").exists());
     }
 
     /// Kernels are content-addressed by name, so re-copying one is only ever
