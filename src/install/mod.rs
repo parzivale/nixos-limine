@@ -9,18 +9,17 @@ mod efi;
 mod entries;
 pub(crate) mod error;
 
+pub(crate) mod effect;
 mod nvram;
 mod plan;
-mod profiles;
 mod secure_boot;
 
 use crate::config::LimineInstallConfig;
-use crate::util::cmd::Output;
-use error::{BiosInstallSnafu, InstallError, ReadSnafu, SyncFsSnafu};
+use effect::Output;
+use error::{BiosInstallSnafu, InstallError};
+use facts::profiles::Profiles;
 use plan::Plan;
-use profiles::Profiles;
 use snafu::ResultExt as _;
-use std::{fs::File, path::Path};
 
 pub(crate) fn run(cfg: &LimineInstallConfig) -> Result<(), InstallError> {
     // everything the install reads from the world, read once
@@ -49,28 +48,26 @@ pub(crate) fn run(cfg: &LimineInstallConfig) -> Result<(), InstallError> {
 
     // what has to be run once those files are in place. worked out before
     // anything is written, so a run that cannot succeed says so first.
-    let fwupd = secure_boot::fwupd_binaries(cfg.fwupd())?;
     let mut commands = Vec::new();
 
     if let Some(efi) = cfg.target().as_ref().here() {
-        commands.extend(efi::commands(cfg, efi, &facts, &limine_conf, &fwupd));
+        commands.extend(efi::commands(cfg, efi, &facts, &limine_conf));
     }
 
     // ---- from here on it is all effects ----
 
-    plan.apply()?;
+    effect::apply(&plan)?;
 
     for command in &commands {
         println!("running {}", command.program().display());
-        command.run()?.success()?;
+        effect::run(command)?.success()?;
     }
 
     // on its own, so that a failure can carry the hint that usually fixes it
     if let Some(bios) = cfg.target().as_ref().there()
         && let Some(command) = bios::command(cfg, bios)
     {
-        command
-            .run()
+        effect::run(&command)
             .and_then(Output::success)
             .context(BiosInstallSnafu)?;
     }
@@ -80,13 +77,4 @@ pub(crate) fn run(cfg: &LimineInstallConfig) -> Result<(), InstallError> {
     }
 
     Ok(())
-}
-
-/// fat32 offers little in the way of recovery after a crash, and an outage
-/// shortly after an update can leave the system unbootable. Flush the boot
-/// filesystem whether or not the install got that far.
-pub(crate) fn sync(mount_point: &Path) -> Result<(), InstallError> {
-    let dir = File::open(mount_point).context(ReadSnafu { path: mount_point })?;
-
-    rustix::fs::syncfs(&dir).context(SyncFsSnafu { path: mount_point })
 }

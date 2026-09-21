@@ -1,10 +1,7 @@
 use super::raw::Raw;
-use crate::install::error::{InstallError, ParseBootSpecSnafu, ReadSnafu};
 use serde::Deserialize;
-use snafu::ResultExt as _;
 use std::{
     collections::BTreeMap,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -94,12 +91,6 @@ impl BootSpec {
 
     pub(crate) const fn xen(&self) -> Option<&Xen> {
         self.xen.as_ref()
-    }
-
-    pub(crate) fn load(path: &Path) -> Result<Self, InstallError> {
-        let json = fs::read_to_string(path).context(ReadSnafu { path })?;
-
-        serde_json::from_str(&json).context(ParseBootSpecSnafu { path })
     }
 
     /// Whether this generation is rendered as a submenu holding its

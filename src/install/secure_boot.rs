@@ -8,17 +8,11 @@ use crate::{
     config::{KeyPolicy, SecureBoot},
     util::cmd::Invocation,
 };
-use snafu::{ResultExt as _, ensure};
-use std::{fs, io, path::Path};
+use snafu::ensure;
+use std::path::Path;
 
 /// Where sbctl keeps the keys it generates.
 pub(crate) const STATE: &str = "/var/lib/sbctl";
-
-/// Whether sbctl already holds keys. Read once, up front, so that everything
-/// below is a function of it.
-pub(crate) fn keys_exist(state: &Path) -> bool {
-    state.exists()
-}
 
 /// Fail before we touch the boot filesystem if the keys we were told to use
 /// do not exist.
@@ -67,38 +61,6 @@ pub(crate) fn commands(
     );
 
     commands
-}
-
-/// fwupd's EFI binaries, which are signed alongside limine's. An fwupd
-/// without any is not an error.
-pub(crate) fn fwupd_binaries(
-    fwupd: Option<&Path>,
-) -> Result<Vec<std::path::PathBuf>, InstallError> {
-    let Some(fwupd) = fwupd else {
-        return Ok(Vec::new());
-    };
-
-    let dir = fwupd.join("libexec/fwupd/efi");
-
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).context(super::error::ReadSnafu { path: dir }),
-    };
-
-    let mut binaries = Vec::new();
-    for entry in entries {
-        let path = entry
-            .context(super::error::ReadSnafu { path: &dir })?
-            .path();
-
-        if path.extension().is_some_and(|extension| extension == "efi") {
-            binaries.push(path);
-        }
-    }
-
-    binaries.sort();
-    Ok(binaries)
 }
 
 #[cfg(test)]

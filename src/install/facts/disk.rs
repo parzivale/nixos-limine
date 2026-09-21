@@ -2,11 +2,9 @@
 //! says about it.
 
 use super::Partition;
-use crate::{
-    install::error::{
-        InstallError, NoSuchPartitionSnafu, PartitionTableSnafu, ReadSnafu, UnknownPartitionSnafu,
-    },
-    util::mountinfo,
+use super::mountinfo;
+use crate::install::error::{
+    InstallError, NoSuchPartitionSnafu, PartitionTableSnafu, ReadSnafu, UnknownPartitionSnafu,
 };
 use snafu::{OptionExt as _, ResultExt as _};
 use std::{

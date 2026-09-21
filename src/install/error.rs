@@ -1,4 +1,5 @@
-use crate::util::{cmd::CmdError, mountinfo::MountinfoError};
+use super::effect::CmdError;
+use super::facts::mountinfo::MountinfoError;
 use snafu::Snafu;
 use std::path::PathBuf;
 

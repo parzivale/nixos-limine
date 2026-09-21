@@ -25,7 +25,6 @@ pub(crate) fn commands(
     efi: &EfiInstall,
     facts: &Facts,
     limine_conf: &str,
-    fwupd: &[std::path::PathBuf],
 ) -> Vec<Invocation> {
     let binary = efi.image_path(cfg.mount_point(), cfg.arch().efi_boot_file());
 
@@ -44,7 +43,7 @@ pub(crate) fn commands(
         efi.secure_boot(),
         &binary,
         facts.sbctl_keys_exist(),
-        fwupd,
+        facts.fwupd_binaries(),
     ));
 
     commands
@@ -61,7 +60,7 @@ pub(crate) fn register(
         EfiDiscovery::Registered => {
             let esp = facts.esp().context(NoEspSnafu)?;
 
-            nvram::register(nvram::entry(esp, cfg.arch().efi_boot_file()))
+            super::effect::register(nvram::entry(esp, cfg.arch().efi_boot_file()))
         }
         EfiDiscovery::Unregistered => {
             eprintln!(
@@ -134,8 +133,9 @@ mod tests {
         if keys_exist {
             facts = fixture::with_sbctl_keys(facts);
         }
+        facts = fixture::with_fwupd(facts, fwupd);
 
-        commands(&cfg, efi, &facts, "timeout: 5\n", fwupd)
+        commands(&cfg, efi, &facts, "timeout: 5\n")
             .iter()
             .map(|invocation| {
                 invocation

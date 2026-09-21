@@ -1,4 +1,4 @@
-use super::error::{InstallError, ReadSnafu};
+use crate::install::error::{InstallError, ReadSnafu};
 use snafu::ResultExt as _;
 use std::{
     fs,

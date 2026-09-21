@@ -7,22 +7,23 @@ use super::disk;
 use super::{Facts, Generation, Partition, Profile, SYSTEM};
 use crate::install::{
     bootspec::BootSpec,
-    error::{InstallError, ReadSnafu},
-    profiles::Profiles,
+    error::{InstallError, ParseBootSpecSnafu, ReadSnafu},
+    facts::profiles::Profiles,
     secure_boot,
 };
 use crate::{
     config::{LimineInstallConfig, Setting},
-    util::{cmd, hash},
+    install::effect,
+    util::{cmd::Invocation, hash},
 };
 use rustix::{fs::Mode, process};
 use snafu::ResultExt as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, File},
+    io,
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
-    process::Command,
 };
 /// Read the world.
 pub(crate) fn gather(
@@ -42,7 +43,8 @@ pub(crate) fn gather(
             .collect(),
         digests: digests(cfg, &referenced)?,
         esp: esp(cfg)?,
-        sbctl_keys_exist: secure_boot::keys_exist(Path::new(secure_boot::STATE)),
+        sbctl_keys_exist: Path::new(secure_boot::STATE).exists(),
+        fwupd: fwupd_binaries(cfg.fwupd())?,
         profiles,
         secrets,
     })
@@ -82,8 +84,54 @@ fn read_generation(
     Ok(Generation {
         number,
         built_at: built_at(&link)?,
-        spec: BootSpec::load(&link.join("boot.json"))?,
+        spec: bootspec(&link.join("boot.json"))?,
     })
+}
+
+/// fwupd's EFI binaries, which are signed alongside limine's. An fwupd
+/// without any is not an error.
+fn fwupd_binaries(fwupd: Option<&Path>) -> Result<Vec<PathBuf>, InstallError> {
+    let Some(fwupd) = fwupd else {
+        return Ok(Vec::new());
+    };
+
+    let dir = fwupd.join("libexec/fwupd/efi");
+
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context(ReadSnafu { path: dir }),
+    };
+
+    let mut binaries = Vec::new();
+    for entry in entries {
+        let path = entry.context(ReadSnafu { path: &dir })?.path();
+
+        if path.extension().is_some_and(|extension| extension == "efi") {
+            binaries.push(path);
+        }
+    }
+
+    binaries.sort();
+    Ok(binaries)
+}
+
+/// Hashed in chunks: these are kernels and initrds, one of each per
+/// generation.
+fn digest(path: &Path) -> Result<String, InstallError> {
+    let mut file = File::open(path).context(ReadSnafu { path })?;
+    let mut hasher = hash::Hasher::new();
+
+    io::copy(&mut file, &mut hasher).context(ReadSnafu { path })?;
+
+    Ok(hasher.finish())
+}
+
+/// A generation's bootspec, as nix wrote it out.
+fn bootspec(path: &Path) -> Result<BootSpec, InstallError> {
+    let json = fs::read_to_string(path).context(ReadSnafu { path })?;
+
+    serde_json::from_str(&json).context(ParseBootSpecSnafu { path })
 }
 
 /// Every file limine.conf will name. Which those are is decided by the
@@ -120,10 +168,7 @@ fn digests(
 
     referenced
         .iter()
-        .map(|path| {
-            let digest = hash::blake2b_file(path).context(ReadSnafu { path })?;
-            Ok((path.clone(), digest))
-        })
+        .map(|path| Ok((path.clone(), digest(path)?)))
         .collect()
 }
 
@@ -173,7 +218,7 @@ fn run_secrets_script(script: &Path, toplevel: &Path) -> Result<Option<Vec<u8>>,
     let tmp = std::env::temp_dir().join(format!("{}-{name}-secrets", std::process::id()));
 
     let previous = process::umask(Mode::from_bits_truncate(0o137));
-    let outcome = cmd::run(Command::new(script).arg(&tmp));
+    let outcome = effect::run(&Invocation::new(script).arg(&tmp));
     process::umask(previous);
 
     let failure = match outcome {

@@ -6,6 +6,8 @@
 
 mod disk;
 mod load;
+pub(crate) mod mountinfo;
+pub(crate) mod profiles;
 
 pub(crate) use load::gather;
 
@@ -20,6 +22,8 @@ use std::{
 pub(crate) struct Facts {
     profiles: Vec<Profile>,
     digests: BTreeMap<PathBuf, String>,
+    /// fwupd's EFI binaries, which are signed alongside ours.
+    pub(super) fwupd: Vec<PathBuf>,
     /// Referenced files that are actually still on disk. A generation can
     /// name one that has since been garbage collected.
     present: BTreeSet<PathBuf>,
@@ -73,6 +77,10 @@ impl Facts {
     /// The secrets a generation's script produced, if it produced any.
     pub(crate) fn secrets(&self, toplevel: &Path) -> Option<&[u8]> {
         self.secrets.get(toplevel).map(Vec::as_slice)
+    }
+
+    pub(crate) fn fwupd_binaries(&self) -> &[PathBuf] {
+        &self.fwupd
     }
 
     pub(crate) const fn sbctl_keys_exist(&self) -> bool {
@@ -187,6 +195,12 @@ pub(crate) mod fixture {
             size: 1_048_576,
             guid: uuid::uuid!("1c06f03b-704e-4657-b9cd-681a087a2fdc"),
         }
+    }
+
+    /// Pretend fwupd has these EFI binaries.
+    pub(crate) fn with_fwupd(mut facts: Facts, binaries: &[PathBuf]) -> Facts {
+        facts.fwupd = binaries.to_vec();
+        facts
     }
 
     /// Pretend sbctl already holds keys.

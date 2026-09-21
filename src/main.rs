@@ -23,7 +23,7 @@ fn main() -> Result<(), Error> {
 
     let result = install::run(&cfg).context(InstallSnafu);
 
-    if let Err(error) = install::sync(cfg.mount_point()) {
+    if let Err(error) = install::effect::sync(cfg.mount_point()) {
         eprintln!("warning: {error}");
     }
 

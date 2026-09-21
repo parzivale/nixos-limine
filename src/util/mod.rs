@@ -2,4 +2,3 @@
 
 pub(crate) mod cmd;
 pub(crate) mod hash;
-pub(crate) mod mountinfo;
